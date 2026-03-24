@@ -8,9 +8,9 @@ import time
 import cv2
 
 from tqdm import tqdm
-from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit
+from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit, QProgressDialog
 from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal
-from qtpy.QtGui import QContextMenuEvent, QTextCursor, QGuiApplication, QIcon, QCloseEvent, QKeySequence, QKeyEvent, QPainter, QClipboard, QImage
+from qtpy.QtGui import QContextMenuEvent, QTextCursor, QGuiApplication, QIcon, QCloseEvent, QKeySequence, QKeyEvent, QPainter, QClipboard, QImage, QShowEvent, QFocusEvent
 
 from utils.logger import logger as LOGGER
 from utils.text_processing import is_cjk, full_len, half_len
@@ -85,6 +85,13 @@ class MainWindow(mainwindow_cls):
         self.backup_blkstyles = []
         self._run_imgtrans_wo_textstyle_update = False
 
+        # Setup autosave timer (3 seconds after changes)
+        from qtpy.QtCore import QTimer
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.timeout.connect(self.on_autosave_timeout)
+        self.autosave_timer.setInterval(3000)  # 3 seconds
+
         self.setupThread()
         self.setupUi()
         self.setupConfig()
@@ -109,6 +116,10 @@ class MainWindow(mainwindow_cls):
             # https://bugreports.qt.io/browse/QTBUG-133215
             self.hideSystemTitleBar()
             self.showMaximized()
+        
+        # Set canvas focus after initialization (fix for keyboard shortcuts not working)
+        
+        # Set canvas focus after initialization - use QTimer to ensure it works
 
     def setStyleSheet(self, styleSheet: str) -> None:
         self.imgtrans_progress_msgbox.setStyleSheet(styleSheet)
@@ -142,6 +153,7 @@ class MainWindow(mainwindow_cls):
         self.leftBar.globalSearchChecker.clicked.connect(self.on_set_gsearch_widget)
         self.leftBar.open_dir.connect(self.OpenProj)
         self.leftBar.open_json_proj.connect(self.openJsonProj)
+        self.leftBar.reload_proj.connect(self.reloadCurrentProject)
         self.leftBar.save_proj.connect(self.manual_save)
         self.leftBar.export_doc.connect(self.on_export_doc)
         self.leftBar.import_doc.connect(self.on_import_doc)
@@ -150,6 +162,11 @@ class MainWindow(mainwindow_cls):
         self.leftBar.export_src_md.connect(lambda : self.on_export_txt(dump_target='source', suffix='.md'))
         self.leftBar.export_trans_md.connect(lambda : self.on_export_txt(dump_target='translation', suffix='.md'))
         self.leftBar.import_trans_txt.connect(self.on_import_trans_txt)
+        # Quick menu buttons
+        self.leftBar.export_src_txt_clicked.connect(self.on_export_src_txt_quick)
+        self.leftBar.import_trans_txt_clicked.connect(self.on_import_trans_txt_quick)
+        self.leftBar.save_all_clicked.connect(self.saveAllPages)
+        self.leftBar.reload_proj_clicked.connect(self.reloadCurrentProject)
 
         self.pageList = PageListView()
         self.pageList.reveal_file.connect(self.on_reveal_file)
@@ -187,6 +204,8 @@ class MainWindow(mainwindow_cls):
         self.canvas.imgtrans_proj = self.imgtrans_proj
         self.canvas.gv.hide_canvas.connect(self.onHideCanvas)
         self.canvas.proj_savestate_changed.connect(self.on_savestate_changed)
+        # Connect autosave timer to save state changes
+        self.canvas.proj_savestate_changed.connect(self.on_projstate_changed_for_autosave)
         self.canvas.textstack_changed.connect(self.on_textstack_changed)
         self.canvas.run_blktrans.connect(self.on_run_blktrans)
         self.canvas.drop_open_folder.connect(self.dropOpenDir)
@@ -521,17 +540,68 @@ class MainWindow(mainwindow_cls):
             self.OpenProj(directory)
 
     def openJsonProj(self, json_path: str):
+        original_save_on_page_changed = self.save_on_page_changed
         try:
             self.opening_dir = True
+            self.save_on_page_changed = False
             self.imgtrans_proj.load_from_json(json_path)
             self.st_manager.clearSceneTextitems()
+            self.canvas.clear_undostack(update_saved_step=True)
             self.leftBar.updateRecentProjList(self.imgtrans_proj.proj_path)
             self.updatePageList()
+            if self.imgtrans_proj.current_img in self.imgtrans_proj.pages:
+                current_idx = self.imgtrans_proj.current_idx
+                if current_idx >= 0:
+                    self.pageList.setCurrentRow(current_idx)
+                self.canvas.updateCanvas()
+                self.st_manager.updateSceneTextitems()
             self.titleBar.setTitleContent(osp.basename(self.imgtrans_proj.proj_path))
             self.opening_dir = False
         except Exception as e:
             self.opening_dir = False
             create_error_dialog(e, self.tr('Failed to load project from') + json_path)
+        finally:
+            self.save_on_page_changed = original_save_on_page_changed
+
+    def reloadCurrentProject(self):
+        if self.imgtrans_proj.directory is None:
+            return
+
+        current_img = self.imgtrans_proj.current_img
+        proj_path = self.imgtrans_proj.proj_path
+        original_save_on_page_changed = self.save_on_page_changed
+        try:
+            self.opening_dir = True
+            self.save_on_page_changed = False
+            self.st_manager.clearSceneTextitems()
+            self.canvas.clear_undostack(update_saved_step=True)
+            self.canvas.clear_text_stack()
+
+            if proj_path is not None and proj_path.lower().endswith('.json') and osp.exists(proj_path):
+                self.imgtrans_proj.load_from_json(proj_path)
+                self.leftBar.updateRecentProjList(self.imgtrans_proj.proj_path)
+                title = osp.basename(self.imgtrans_proj.proj_path)
+            else:
+                self.generate_tif_thumbnails(self.imgtrans_proj.directory)
+                self.imgtrans_proj.load(self.imgtrans_proj.directory)
+                title = osp.basename(self.imgtrans_proj.directory)
+
+            if current_img in self.imgtrans_proj.pages:
+                self.imgtrans_proj.set_current_img(current_img)
+
+            self.updatePageList()
+            if self.imgtrans_proj.current_img in self.imgtrans_proj.pages:
+                current_idx = self.imgtrans_proj.current_idx
+                if current_idx >= 0:
+                    self.pageList.setCurrentRow(current_idx)
+                self.canvas.updateCanvas()
+                self.st_manager.updateSceneTextitems()
+            self.titleBar.setTitleContent(title)
+        except Exception as e:
+            create_error_dialog(e, self.tr('Failed to reload current project'))
+        finally:
+            self.opening_dir = False
+            self.save_on_page_changed = original_save_on_page_changed
         
     def updatePageList(self):
         if self.pageList.count() != 0:
@@ -560,9 +630,64 @@ class MainWindow(mainwindow_cls):
         pcfg.show_page_list = setup
         save_config()
 
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        return super().keyPressEvent(event)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Auto-select canvas when window is shown"""
+        super().showEvent(event)
+        # ALWAYS restore canvas focus when window is shown
+        # This ensures keyboard shortcuts work immediately when the app is opened
+        from qtpy.QtCore import QTimer
+        def restore_canvas_focus_on_show():
+            if hasattr(self, 'canvas') and not self.canvas.gv.hasFocus():
+                self.activateWindow()
+                QApplication.setActiveWindow(self)
+                self.canvas.gv.setFocus()
+        QTimer.singleShot(100, restore_canvas_focus_on_show)
+        
+        # Auto-select canvas when window is shown - use QTimer to ensure it works
+        if hasattr(self, 'canvas'):
+            from qtpy.QtCore import QTimer
+            def delayed_focus():
+                # Activate window first, then set focus
+                self.activateWindow()
+                QApplication.setActiveWindow(self)
+                self.canvas.gv.setFocus()
+            QTimer.singleShot(200, delayed_focus)  # Increase delay to 200ms
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        # Check if there are unsaved changes
         if not self.imgtrans_proj.is_empty:
-            self.conditional_save(keep_exist_as_backup=True)
+            has_unsaved_changes = (self.canvas.projstate_unsaved or 
+                                  self.canvas.text_change_unsaved() or 
+                                  self.canvas.draw_change_unsaved())
+            
+            if has_unsaved_changes:
+                # Ask user if they want to save
+                msg = QMessageBox(self)
+                msg.setWindowTitle(self.tr('Unsaved Changes'))
+                msg.setText(self.tr('You have unsaved changes. Do you want to save before closing?'))
+                msg.setStandardButtons(QMessageBox.StandardButton.Save | 
+                                      QMessageBox.StandardButton.Discard | 
+                                      QMessageBox.StandardButton.Cancel)
+                msg.setDefaultButton(QMessageBox.StandardButton.Save)
+                msg.setIcon(QMessageBox.Icon.Warning)
+                
+                ret = msg.exec_()
+                
+                if ret == QMessageBox.StandardButton.Cancel:
+                    # User cancelled, don't close
+                    event.ignore()
+                    return
+                elif ret == QMessageBox.StandardButton.Save:
+                    # User wants to save
+                    self.conditional_save(keep_exist_as_backup=True)
+            else:
+                # No unsaved changes, just save normally
+                self.conditional_save(keep_exist_as_backup=True)
+        
+        # Wait for save thread to finish
         while True:
             if not self.imsave_thread.isRunning():
                 break
@@ -580,6 +705,17 @@ class MainWindow(mainwindow_cls):
                     self.titleBar.maxBtn.setChecked(True)
         elif event.type() == QEvent.Type.ActivationChange:
             self.canvas.on_activation_changed()
+            # Restore canvas focus when window is activated
+            if self.isActiveWindow():
+                from qtpy.QtCore import QTimer
+                def restore_focus():
+                    # Only restore if no text editor has focus
+                    focus_widget = QApplication.focusWidget()
+                    from .textedit_area import SourceTextEdit, TransTextEdit
+                    if not isinstance(focus_widget, (SourceTextEdit, TransTextEdit)):
+                        if not self.canvas.gv.hasFocus():
+                            self.canvas.gv.setFocus()
+                QTimer.singleShot(50, restore_focus)
 
         super().changeEvent(event)
     
@@ -600,12 +736,10 @@ class MainWindow(mainwindow_cls):
         self.canvas.clearToolStates()
 
     def conditional_save(self, keep_exist_as_backup=False):
-        if self.canvas.projstate_unsaved and not self.opening_dir:
-            update_scene_text = save_proj = self.canvas.text_change_unsaved()
-            save_rst_only = not self.canvas.draw_change_unsaved()
-            if not save_rst_only:
-                save_proj = True
-            
+        if not self.opening_dir:
+            update_scene_text = True
+            save_proj = True
+            save_rst_only = False
             self.saveCurrentPage(update_scene_text, save_proj, restore_interface=True, save_rst_only=save_rst_only, keep_exist_as_backup=keep_exist_as_backup)
 
     def pageListCurrentItemChanged(self):
@@ -617,7 +751,19 @@ class MainWindow(mainwindow_cls):
             self.imgtrans_proj.set_current_img(item.text())
             self.canvas.clear_undostack(update_saved_step=True)
             self.canvas.updateCanvas()
+            # Scroll to top when changing page
+            self.canvas.gv.verticalScrollBar().setValue(0)
+            self.canvas.gv.horizontalScrollBar().setValue(0)
             self.st_manager.updateSceneTextitems()
+            # Restore text block mode after updating scene items
+            if self.bottomBar.textblockChecker.isChecked() or pcfg.imgtrans_textblock:
+                self.setTextBlockMode()
+            # Restore canvas focus after page change
+            from qtpy.QtCore import QTimer
+            def restore_canvas_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(100, restore_canvas_focus)
             self.titleBar.setTitleContent(page_name=self.imgtrans_proj.current_img)
             self.module_manager.handle_page_changed()
             self.drawingPanel.handle_page_changed()
@@ -687,7 +833,17 @@ class MainWindow(mainwindow_cls):
             shortcut.activated.connect(partial(self.drawingPanel.shortcutSetCurrentToolByName, tool_name))
             self.drawingPanel.setShortcutTip(tool_name, shortcut_key)
 
+        shortcutDecrBrush = QShortcut(QKeySequence("["), self)
+        shortcutDecrBrush.activated.connect(self.drawingPanel.on_decre_pensize)
+        shortcutIncrBrush = QShortcut(QKeySequence("]"), self)
+        shortcutIncrBrush.activated.connect(self.drawingPanel.on_incre_pensize)
+
+        # Ctrl+E for OCR
+        shortcutOCR = QShortcut(QKeySequence("Ctrl+E"), self)
+        shortcutOCR.activated.connect(self.shortcutOCR)
+
     def shortcutNext(self):
+        
         sender: QShortcut = self.sender()
         if isinstance(sender, QShortcut):
             if sender.key() == QKEY.Key_D:
@@ -708,6 +864,7 @@ class MainWindow(mainwindow_cls):
                     self.pageList.setCurrentRow(row)
 
     def shortcutBefore(self):
+        
         sender: QShortcut = self.sender()
         if isinstance(sender, QShortcut):
             if sender.key() == QKEY.Key_A:
@@ -749,8 +906,14 @@ class MainWindow(mainwindow_cls):
                 self.canvas.delete_textblks.emit(0)
 
     def shortcutSelectAll(self):
+        
+        # Select all text blocks when in main view (index 0) and text panel is active (index 1)
         if self.centralStackWidget.currentIndex() == 0:
-            if self.textPanel.isVisible():
+            # Check if textPanel is the current widget in rightComicTransStackPanel (index 1)
+            if hasattr(self, 'rightComicTransStackPanel') and self.rightComicTransStackPanel.currentIndex() == 1:
+                self.st_manager.set_blkitems_selection(True)
+            # Also allow if textPanel is visible (fallback check)
+            elif hasattr(self, 'textPanel') and self.textPanel.isVisible():
                 self.st_manager.set_blkitems_selection(True)
 
     def shortcutSpace(self):
@@ -774,6 +937,13 @@ class MainWindow(mainwindow_cls):
     def shortcutUnderline(self):
         if self.textPanel.formatpanel.isVisible():
             self.textPanel.formatpanel.formatBtnGroup.underlineBtn.click()
+
+    def shortcutOCR(self):
+        """Ctrl+E: Run OCR on selected text blocks."""
+        if self.canvas.textEditMode():
+            blkitem_list = self.canvas.selected_text_items()
+            if len(blkitem_list) > 0:
+                self.translateBlkitemList(blkitem_list, 0)  # mode 0 = OCR only
 
     def on_redo(self):
         self.canvas.redo()
@@ -832,7 +1002,6 @@ class MainWindow(mainwindow_cls):
 
     def show_MT_keyword_window(self):
         self.mtSubWidget.show()
-
 
     def show_OCR_keyword_window(self):
         self.ocrSubWidget.show()
@@ -1068,8 +1237,62 @@ class MainWindow(mainwindow_cls):
             LOGGER.debug('Manually saving...')
             self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=True, save_rst_only=False)
 
-    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False):
+    def saveAllPages(self):
+        if self.pageList.count() == 0:
+            return
+        original_idx = self.pageList.currentRow()
+        original_save_on_page_changed = self.save_on_page_changed
+        self.save_on_page_changed = False  # Disable auto-save during batch save to avoid double calls
         
+        progress = QProgressDialog(self.tr("Saving all pages..."), self.tr("Cancel"), 0, self.pageList.count(), self)
+        progress.setModal(True)
+        progress.show()
+
+        for i in range(self.pageList.count()):
+            progress.setValue(i)
+            if progress.wasCanceled():
+                break
+            self.pageList.setCurrentRow(i)
+            # Process events to ensure UI updates and canvas is ready
+            self.app.processEvents()
+            self.saveCurrentPage(update_scene_text=True, save_proj=True)
+            
+        progress.setValue(self.pageList.count())
+        self.pageList.setCurrentRow(original_idx)
+        self.save_on_page_changed = original_save_on_page_changed
+
+    def applyFontToAllPagesAndSave(self):
+        if self.pageList.count() == 0:
+            return
+        original_idx = self.pageList.currentRow()
+        original_save_on_page_changed = self.save_on_page_changed
+        self.save_on_page_changed = False
+
+        n_pages = self.pageList.count()
+        progress = QProgressDialog(
+            self.tr("Applying font style to all pages..."),
+            self.tr("Cancel"), 0, n_pages, self
+        )
+        progress.setWindowTitle(self.tr("Apply Font Style to All Pages"))
+        progress.setMinimumDuration(0)
+        progress.setModal(True)
+        progress.show()
+
+        for i in range(n_pages):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            progress.setLabelText(self.tr("Saving page {} / {}...").format(i + 1, n_pages))
+            self.pageList.setCurrentRow(i)
+            self.app.processEvents()
+            self.saveCurrentPage(update_scene_text=True, save_proj=True)
+
+        progress.setValue(n_pages)
+        self.pageList.setCurrentRow(original_idx)
+        self.app.processEvents()
+        self.save_on_page_changed = original_save_on_page_changed
+
+    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False):
         if not self.imgtrans_proj.img_valid:
             return
         
@@ -1081,16 +1304,17 @@ class MainWindow(mainwindow_cls):
             if n_sel_textitems == 1 and sel_textitem[0].isEditing():
                 editing_textitem = sel_textitem[0]
         
-        if update_scene_text:
+        if update_scene_text or self.canvas.text_change_unsaved():
             self.st_manager.updateTextBlkList()
         
         if self.rightComicTransStackPanel.isHidden():
             self.bottomBar.texteditChecker.click()
 
-        restore_textblock_mode = False
-        if pcfg.imgtrans_textblock:
-            restore_textblock_mode = True
-            self.bottomBar.textblockChecker.click()
+        # DO NOT touch checkbox state - only user can control it via W key or clicking
+        # Checkbox should only be changed by:
+        # 1. User pressing W key (shortcutTextblock)
+        # 2. User clicking the checkbox directly
+        # No other code should modify checkbox state
 
         hide_tsc = False
         if self.st_manager.txtblkShapeControl.isVisible():
@@ -1103,11 +1327,13 @@ class MainWindow(mainwindow_cls):
         if save_proj:
             try:
                 self.imgtrans_proj.save(keep_exist_as_backup=keep_exist_as_backup)
-                if not save_rst_only:
+                save_draw_outputs = (not save_rst_only) and (self.canvas.draw_change_unsaved() or self.canvas.drawingLayer.drawed())
+                if save_draw_outputs:
+                    self.imgtrans_proj.cleanup_stale_output_files(self.imgtrans_proj.current_img)
                     mask_path = self.imgtrans_proj.get_mask_path()
                     mask_array = self.imgtrans_proj.mask_array
                     if mask_array is not None:
-                        self.imsave_thread.saveImg(mask_path, mask_array, save_params={'ext': pcfg.intermediate_imgsave_ext})
+                        self.imsave_thread.saveImg(mask_path, mask_array, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality})
                     inpainted_path = self.imgtrans_proj.get_inpainted_path()
                     if self.canvas.drawingLayer.drawed():
                         inpainted = self.canvas.base_pixmap.copy()
@@ -1117,24 +1343,37 @@ class MainWindow(mainwindow_cls):
                     else:
                         inpainted = self.imgtrans_proj.inpainted_array
                     if inpainted is not None:
-                        self.imsave_thread.saveImg(inpainted_path, inpainted, save_params={'ext': pcfg.intermediate_imgsave_ext}, keep_alpha=self.imgtrans_proj.current_has_alpha())
+                        self.imsave_thread.saveImg(inpainted_path, inpainted, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
             except Exception as e:
                 LOGGER.error(f"Failed to save project files: {e}")
 
         # Render the final result image properly
+        # For autosave, preserve selection state (autosave should not affect selection)
+        preserve_selection = not restore_interface  # Preserve selection during autosave
         try:
-            img = self.canvas.render_result_img()
+            img = self.canvas.render_result_img(preserve_selection=preserve_selection)
             imsave_path = self.imgtrans_proj.get_result_path(self.imgtrans_proj.current_img)
+            self.imgtrans_proj.cleanup_stale_output_files(self.imgtrans_proj.current_img, targets={'result'})
             self.imsave_thread.saveImg(imsave_path, img, self.imgtrans_proj.current_img, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
         except Exception as e:
             LOGGER.error(f"Failed to render and save result image: {e}")
+        
+        # Restore text block display state after render_result_img (which calls clearSelection)
+        # This is especially important for autosave which doesn't restore interface
+        # For autosave, ALWAYS restore the text block display state if it was enabled
+        if not restore_interface:
+            # Autosave: restore text block display state to match user preference
+            if getattr(pcfg, 'imgtrans_textblock', False):
+                self.st_manager.showTextblkItemRect(True)
+                # Also ensure canvas textblock_mode matches
+                if not self.canvas.textblock_mode:
+                    self.canvas.textblock_mode = True
             
         self.canvas.setProjSaveState(False)
         self.canvas.update_saved_undostep()
 
         if restore_interface:
-            if restore_textblock_mode:
-                self.bottomBar.textblockChecker.click()
+            # DO NOT touch checkbox state - only user can control it via W key or clicking
             if hide_tsc:
                 self.st_manager.txtblkShapeControl.show()
             if set_canvas_focus:
@@ -1236,7 +1475,6 @@ class MainWindow(mainwindow_cls):
         
         self.translateBlkitemList(blkitem_list, -1)
 
-
     def translateBlkitemList(self, blkitem_list: List, mode: int) -> bool:
 
         tgt_img = self.imgtrans_proj.img_array
@@ -1263,12 +1501,12 @@ class MainWindow(mainwindow_cls):
         self.module_manager.runBlktransPipeline(blk_list, tgt_img, mode, blk_ids, tgt_mask = tgt_mask)
         return True
 
-
     def finishTranslatePage(self, page_key):
         if page_key == self.imgtrans_proj.current_img:
             self.st_manager.updateTranslation()
 
     def on_imgtrans_pipeline_finished(self):
+        
         self.backup_blkstyles.clear()
         self._run_imgtrans_wo_textstyle_update = False
         self.postprocess_mt_toggle = True
@@ -1280,6 +1518,70 @@ class MainWindow(mainwindow_cls):
             self.on_export_txt('source')
         if shared.HEADLESS:
             self.run_next_dir()
+        else:
+            # Reset angle for ALL textblocks in ALL pages after OCR finished
+            # Reset angles directly in project data for all pages
+            LOGGER.info('[Reset Angle] Resetting angles for all textblocks in all pages after OCR completion')
+            
+            # Reset angle for all text blocks in all pages
+            for page_name in self.imgtrans_proj.pages:
+                for blk in self.imgtrans_proj.pages[page_name]:
+                    blk.angle = 0
+            
+            # Reset angle for current page UI items if they exist
+            all_text_items = self.st_manager.textblk_item_list
+            if len(all_text_items) > 0:
+                # Use the reset angle function with all text items directly
+                # This ensures undo/redo support and proper UI updates
+                self.st_manager.onResetAngle(reset_all=True, items=all_text_items)
+            
+            
+            # IMPORTANT: Save project immediately after resetting angles
+            # Update current page text block list first
+            if len(all_text_items) > 0:
+                self.st_manager.updateTextBlkList()
+            # Save current page and entire project
+            self.saveCurrentPage(update_scene_text=False, save_proj=True, restore_interface=False, save_rst_only=False)
+            
+            self.activateWindow()
+            # ALWAYS restore canvas focus after pipeline finished to ensure keyboard shortcuts work
+            # Set focus immediately first, then use QTimer as backup to ensure focus persists
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+            # Use QTimer to ensure focus is set after all UI updates are complete
+            from qtpy.QtCore import QTimer
+            def restore_canvas_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            # Use longer delay to ensure all UI operations are complete
+            QTimer.singleShot(200, restore_canvas_focus)
+            # Also set focus again after a longer delay to ensure it persists
+            QTimer.singleShot(500, restore_canvas_focus)
+            # Final check after 1 second to ensure focus is maintained
+            QTimer.singleShot(1000, restore_canvas_focus)
+            # Additional check after 2 seconds to ensure focus persists
+            QTimer.singleShot(2000, restore_canvas_focus)
+            # Final check after 3 seconds to ensure focus is maintained
+            QTimer.singleShot(3000, restore_canvas_focus)
+            
+            
+            # CRITICAL: Force canvas focus one more time after all timers are set
+            # This ensures focus is set even if something steals it immediately
+            from qtpy.QtCore import QTimer
+            def force_canvas_focus_final():
+                self.activateWindow()
+                QApplication.setActiveWindow(self)
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(50, force_canvas_focus_final)  # Very short delay to ensure it runs after other operations
+            # Also force focus after progress dialog is hidden (if it exists)
+            # Progress dialog hiding might steal focus
+            def restore_after_progress_hide():
+                self.activateWindow()
+                QApplication.setActiveWindow(self)
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(300, restore_after_progress_hide)  # Delay to ensure progress dialog is hidden
 
     def postprocess_translations(self, blk_list: List[TextBlock]) -> None:
         src_is_cjk = is_cjk(pcfg.module.translate_source)
@@ -1368,9 +1670,18 @@ class MainWindow(mainwindow_cls):
                     sw = blk.stroke_width
                     if sw > 0 and pcfg.module.enable_ocr and pcfg.module.enable_detect and not override_fnt_size:
                         blk.font_size = blk.font_size / (1 + sw)
+                    
+                    # Apply fixed font only when the option is enabled during detection-driven runs.
+                    if pcfg.fixed_font_enabled and pcfg.module.enable_detect:
+                        blk.font_size = pcfg.fixed_font_size
+                        blk.font_family = pcfg.fixed_font_family
+                        if blk.rich_text:
+                            blk.rich_text = set_html_family(blk.rich_text, pcfg.fixed_font_family)
+                    
 
             self.st_manager.auto_textlayout_flag = pcfg.let_autolayout_flag and \
                 (pcfg.module.enable_detect or pcfg.module.enable_translate)
+        
         
         if page_index != self.pageList.currentIndex().row():
             self.pageList.setCurrentRow(page_index)
@@ -1394,6 +1705,75 @@ class MainWindow(mainwindow_cls):
     def on_savestate_changed(self, unsaved: bool):
         save_state = self.tr('unsaved') if unsaved else self.tr('saved')
         self.titleBar.setTitleContent(save_state=save_state)
+    
+    def on_projstate_changed_for_autosave(self, unsaved: bool):
+        """Restart autosave timer when project state changes"""
+        if unsaved and not self.page_changing and not self.opening_dir:
+            # Restart timer when there are unsaved changes
+            self.autosave_timer.stop()
+            self.autosave_timer.start()
+    
+    def on_autosave_timeout(self):
+        """Auto-save after 3 seconds of inactivity"""
+        if self.canvas.projstate_unsaved and not self.page_changing and not self.opening_dir:
+            if self.imgtrans_proj.img_valid:
+                # Save the current text block display state and selection state before autosave
+                should_show_rect = getattr(pcfg, 'imgtrans_textblock', False)
+                # Save current selection state to restore after autosave
+                # Autosave should NOT affect selection - it's just a save operation
+                selected_text_items = self.canvas.selected_text_items()
+                selected_item_ids = [item.idx for item in selected_text_items]
+                # Save shape control state before autosave
+                # Autosave should NOT affect UI - it's just a save operation
+                shape_control_visible = self.st_manager.txtblkShapeControl.isVisible()
+                shape_control_blk_item_id = None
+                if shape_control_visible and self.st_manager.txtblkShapeControl.blk_item is not None:
+                    shape_control_blk_item_id = self.st_manager.txtblkShapeControl.blk_item.idx
+                # Auto-save current page
+                # IMPORTANT: restore_interface=False means we need to manually restore text block display state
+                # after autosave to prevent the blue rectangles from disappearing
+                # Selection will be preserved automatically by render_result_img() when preserve_selection=True
+                self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False)
+                
+                # IMPORTANT: Restore selection after autosave
+                # render_result_img() clears selection, so we need to restore it explicitly
+                if len(selected_item_ids) > 0:
+                    self.canvas.block_selection_signal = True
+                    for blk_item in self.st_manager.textblk_item_list:
+                        if blk_item.idx in selected_item_ids:
+                            blk_item.setSelected(True)
+                    self.canvas.block_selection_signal = False
+                    # Also restore textEditList selection state
+                    self.st_manager.textEditList.set_selected_list(selected_item_ids)
+                # ALWAYS restore canvas focus after autosave to ensure keyboard shortcuts work
+                # Autosave should not affect focus - it's just a save operation
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+                
+                # Restore shape control state after autosave
+                # Autosave should NOT affect UI - it's just a save operation
+                if shape_control_visible and shape_control_blk_item_id is not None:
+                    # Find the text block item and restore shape control
+                    for blk_item in self.st_manager.textblk_item_list:
+                        if blk_item.idx == shape_control_blk_item_id:
+                            self.st_manager.txtblkShapeControl.setBlkItem(blk_item)
+                            break
+                elif shape_control_visible:
+                    # Shape control was visible but no blk_item - just show it
+                    self.st_manager.txtblkShapeControl.show()
+                # ALWAYS restore text block display state after autosave if it was enabled
+                # This ensures the blue rectangles remain visible after autosave
+                if should_show_rect:
+                    # Restore draw_rect state for all text blocks
+                    self.st_manager.showTextblkItemRect(True)
+                    # Sync canvas textblock_mode to match
+                    if not self.canvas.textblock_mode:
+                        self.canvas.textblock_mode = True
+                # ALWAYS restore canvas focus after autosave to ensure keyboard shortcuts work
+                # This is critical for shortcuts like Ctrl+A, A, D, W to function properly
+                # Restore focus regardless of text block display state
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
 
     def on_textstack_changed(self):
         if not self.page_changing:
@@ -1408,7 +1788,15 @@ class MainWindow(mainwindow_cls):
         if len(blk_ids) < 1:
             return
         
-        blkitem_list = [self.st_manager.textblk_item_list[idx] for idx in blk_ids]
+        # Filter out invalid indices - the list may have changed while the async pipeline was running
+        # (e.g., user changed pages, deleted blocks, etc.)
+        max_idx = len(self.st_manager.textblk_item_list)
+        valid_blk_ids = [idx for idx in blk_ids if 0 <= idx < max_idx]
+        
+        if len(valid_blk_ids) < 1:
+            return
+        
+        blkitem_list = [self.st_manager.textblk_item_list[idx] for idx in valid_blk_ids]
 
         pairw_list = []
         for blk in blkitem_list:
@@ -1470,8 +1858,7 @@ class MainWindow(mainwindow_cls):
     def on_run_imgtrans(self, continue_mode=False):
         self.backup_blkstyles.clear()
 
-        if self.bottomBar.textblockChecker.isChecked():
-            self.bottomBar.textblockChecker.click()
+        # DO NOT touch checkbox state - only user can control it via W key or clicking
         self.postprocess_mt_toggle = False
 
         all_disabled = pcfg.module.all_stages_disabled()
@@ -1520,6 +1907,17 @@ class MainWindow(mainwindow_cls):
         
         # 如果有指定pages_to_process或者是continue_mode，则传递页面列表
         self.module_manager.runImgtransPipeline(pages_to_process if (pages_to_process or continue_mode) else None)
+        
+        # ALWAYS ensure canvas has focus when starting pipeline
+        # This ensures keyboard shortcuts work immediately
+        if not self.canvas.gv.hasFocus():
+            self.canvas.gv.setFocus()
+        # Use QTimer to ensure focus persists after pipeline starts
+        from qtpy.QtCore import QTimer
+        def ensure_canvas_focus():
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+        QTimer.singleShot(100, ensure_canvas_focus)
 
     def on_transpanel_changed(self):
         self.canvas.editor_index = self.rightComicTransStackPanel.currentIndex()
@@ -1583,12 +1981,116 @@ class MainWindow(mainwindow_cls):
     def on_import_doc(self):
         self.import_doc_thread.importDoc(self.imgtrans_proj)
 
+    def save_all_pages(self):
+        """Save all pages before export"""
+        if not self.imgtrans_proj.img_valid:
+            return
+        
+        current_page = self.imgtrans_proj.current_img
+        original_save_on_page_changed = self.save_on_page_changed
+        self.save_on_page_changed = False  # Disable auto-save during batch save
+        
+        try:
+            # Save current page first
+            if self.canvas.projstate_unsaved or self.canvas.text_change_unsaved():
+                self.saveCurrentPage(update_scene_text=True, save_proj=False, restore_interface=False, save_rst_only=False)
+            
+            # Save all other pages
+            for page_name in self.imgtrans_proj.pages:
+                if page_name != current_page:
+                    # Switch to page
+                    self.page_changing = True
+                    self.imgtrans_proj.set_current_img(page_name)
+                    self.canvas.clear_undostack(update_saved_step=True)
+                    self.canvas.updateCanvas()
+                    self.st_manager.updateSceneTextitems()
+                    self.titleBar.setTitleContent(page_name=self.imgtrans_proj.current_img)
+                    self.page_changing = False
+                    
+                    # Check if page has unsaved changes (need to check after updateSceneTextitems)
+                    # Note: text_change_unsaved() checks current page, so we need to update first
+                    if self.canvas.projstate_unsaved:
+                        self.saveCurrentPage(update_scene_text=True, save_proj=False, restore_interface=False, save_rst_only=False)
+            
+            # Restore original page
+            self.page_changing = True
+            self.imgtrans_proj.set_current_img(current_page)
+            self.canvas.clear_undostack(update_saved_step=True)
+            self.canvas.updateCanvas()
+            self.st_manager.updateSceneTextitems()
+            self.titleBar.setTitleContent(page_name=self.imgtrans_proj.current_img)
+            self.page_changing = False
+            
+            # Save project file
+            self.imgtrans_proj.save()
+        finally:
+            self.save_on_page_changed = original_save_on_page_changed
+    
+    def on_export_src_txt_quick(self):
+        """Export source to TXT from quick menu - save all pages first"""
+        try:
+            # Save all pages before export
+            self.save_all_pages()
+            # Export
+            self.on_export_txt(dump_target='source', suffix='.txt')
+            # Restore canvas focus after export (on_export_txt already handles this, but ensure it's done)
+            from qtpy.QtCore import QTimer
+            def restore_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(300, restore_focus)
+        except Exception as e:
+            create_error_dialog(e, self.tr('Failed to export source as TEXT file'))
+            # Restore canvas focus even if error occurred
+            from qtpy.QtCore import QTimer
+            def restore_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(200, restore_focus)
+    
+    def on_import_trans_txt_quick(self):
+        """Import translation TXT from quick menu - ensure save system works"""
+        try:
+            # Import translation
+            self.on_import_trans_txt()
+            # After import, save the project to ensure changes are saved
+            if self.imgtrans_proj.img_valid:
+                # Save current page if there are changes
+                if self.canvas.projstate_unsaved or self.canvas.text_change_unsaved():
+                    self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False)
+            # Restore canvas focus after import (on_import_trans_txt already handles this, but ensure it's done)
+            from qtpy.QtCore import QTimer
+            def restore_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(300, restore_focus)
+        except Exception as e:
+            create_error_dialog(e, self.tr('Failed to import translation from TXT file'))
+            # Restore canvas focus even if error occurred
+            from qtpy.QtCore import QTimer
+            def restore_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(200, restore_focus)
+    
     def on_export_txt(self, dump_target, suffix='.txt'):
         try:
             self.imgtrans_proj.dump_txt(dump_target=dump_target, suffix=suffix)
             create_info_dialog(self.tr('Text file exported to ') + self.imgtrans_proj.dump_txt_path(dump_target, suffix))
+            # Restore canvas focus after dialog is closed
+            from qtpy.QtCore import QTimer
+            def restore_focus_after_dialog():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(200, restore_focus_after_dialog)
         except Exception as e:
             create_error_dialog(e, self.tr('Failed to export as TEXT file'))
+            # Restore canvas focus even if error occurred
+            from qtpy.QtCore import QTimer
+            def restore_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(200, restore_focus)
 
     def on_import_trans_txt(self):
         try:
@@ -1604,6 +2106,15 @@ class MainWindow(mainwindow_cls):
             if self.imgtrans_proj.current_img in matched_pages:
                 self.canvas.clear_undostack(update_saved_step=True)
                 self.st_manager.updateSceneTextitems()
+                # Restore text block mode after updating scene items
+                if self.bottomBar.textblockChecker.isChecked() or pcfg.imgtrans_textblock:
+                    self.setTextBlockMode()
+                # Restore canvas focus after import
+                from qtpy.QtCore import QTimer
+                def restore_canvas_focus():
+                    if not self.canvas.gv.hasFocus():
+                        self.canvas.gv.setFocus()
+                QTimer.singleShot(100, restore_canvas_focus)
 
             if all_matched:
                 msg = self.tr('Translation imported and matched successfully.')
@@ -1625,9 +2136,21 @@ class MainWindow(mainwindow_cls):
                     blk.translation = self.mtSubWidget.sub_text(blk.translation)
             
             create_info_dialog(msg)
+            # Restore canvas focus after dialog is closed
+            from qtpy.QtCore import QTimer
+            def restore_focus_after_dialog():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(200, restore_focus_after_dialog)
 
         except Exception as e:
             create_error_dialog(e, self.tr('Failed to import translation from ') + selected_file)
+            # Restore canvas focus even if error occurred
+            from qtpy.QtCore import QTimer
+            def restore_focus():
+                if not self.canvas.gv.hasFocus():
+                    self.canvas.gv.setFocus()
+            QTimer.singleShot(200, restore_focus)
 
     def on_reveal_file(self):
         current_img_path = self.imgtrans_proj.current_img_path()
@@ -1650,12 +2173,33 @@ class MainWindow(mainwindow_cls):
             self.leftStackWidget.hide()
 
     def on_fin_export_doc(self):
+        # Restore canvas focus after export
+        from qtpy.QtCore import QTimer
+        def restore_focus():
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+        QTimer.singleShot(200, restore_focus)
         msg = QMessageBox()
         msg.setText(self.tr('Export to ') + self.imgtrans_proj.doc_path())
         msg.exec_()
+        # Restore canvas focus after dialog is closed
+        from qtpy.QtCore import QTimer
+        def restore_focus_after_dialog():
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+        QTimer.singleShot(200, restore_focus_after_dialog)
 
     def on_fin_import_doc(self):
         self.st_manager.updateSceneTextitems()
+        # Restore text block mode after updating scene items
+        if self.bottomBar.textblockChecker.isChecked() or pcfg.imgtrans_textblock:
+            self.setTextBlockMode()
+        # Restore canvas focus after import
+        from qtpy.QtCore import QTimer
+        def restore_canvas_focus():
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+        QTimer.singleShot(100, restore_canvas_focus)
 
     def on_global_replace_finished(self):
         rt = self.global_search_widget.replace_thread
@@ -1694,6 +2238,9 @@ class MainWindow(mainwindow_cls):
                     pass
         except Exception:
             pass
+
+        # NOTE: Do NOT reset angle here - angle will be reset after pipeline finished in on_imgtrans_pipeline_finished()
+        # This prevents angle from being reset when creating new text blocks or during OCR
 
     def translate_preprocess(self, translations: List[str] = None, textblocks: List[TextBlock] = None, translator = None, source_text:list = []):
         for i in range(len(source_text)):

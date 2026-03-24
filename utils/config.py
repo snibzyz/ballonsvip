@@ -30,6 +30,10 @@ class ModuleConfig(Config):
     enable_inpaint: bool = True
     # 是否在 OCR 后进行字体检测（默认不启用）
     ocr_font_detect: bool = False
+    # OCR processing mode: 'queue' or 'batch'
+    ocr_mode: str = 'queue'
+    # Maximum batch size for OCR batch mode
+    ocr_max_batch: int = 100
     textdetector_params: Dict = field(default_factory=lambda: dict())
     ocr_params: Dict = field(default_factory=lambda: dict())
     translator_params: Dict = field(default_factory=lambda: dict())
@@ -134,6 +138,9 @@ class ProgramConfig(Config):
     let_uppercase_flag: bool = True
     let_show_only_custom_fonts_flag: bool = False
     let_textstyle_indep_flag: bool = False
+    fixed_font_enabled: bool = False
+    fixed_font_size: float = 72
+    fixed_font_family: str = "TH Sarabun New"
     text_styles_path: str = osp.join(shared.DEFAULT_TEXTSTYLE_DIR, 'default.json')
     fsearch_case: bool = False
     fsearch_whole_word: bool = False
@@ -158,6 +165,8 @@ class ProgramConfig(Config):
     imgsave_quality: int = 100
     imgsave_ext: str = '.png'
     intermediate_imgsave_ext: str = '.png'
+    inpaint_imgsave_ext: str = '.png'
+    mask_imgsave_ext: str = '.png'
     show_text_style_preset: bool = True
     expand_tstyle_panel: bool = True
     show_text_effect_panel: bool = True

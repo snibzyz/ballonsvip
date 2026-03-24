@@ -1,6 +1,6 @@
 from typing import List, Union, Tuple
 
-from qtpy.QtWidgets import QPushButton, QKeySequenceEdit, QLayout, QGridLayout, QHBoxLayout, QVBoxLayout, QTreeView, QWidget, QLabel, QSizePolicy, QSpacerItem, QCheckBox, QSplitter, QScrollArea, QLineEdit
+from qtpy.QtWidgets import QPushButton, QKeySequenceEdit, QLayout, QGridLayout, QHBoxLayout, QVBoxLayout, QTreeView, QWidget, QLabel, QSizePolicy, QSpacerItem, QCheckBox, QSplitter, QScrollArea, QLineEdit, QSpinBox
 from qtpy.QtCore import Qt, Signal, QSize, QEvent, QItemSelection
 from qtpy.QtGui import QStandardItem, QStandardItemModel, QMouseEvent, QFont, QIntValidator, QValidator, QFocusEvent
 
@@ -447,6 +447,45 @@ class ConfigPanel(Widget):
         self.let_family_combox.activated.connect(self.on_family_flag_changed)
         global_fntfmt_layout.addWidget(sublock, 3, 1)
 
+        # Fixed Font section
+        self.fixed_font_checker, fixed_font_sublock = checkbox_with_label(self.tr('Fixed Font'), discription=self.tr('Apply fixed font size and family after detection'))
+        self.fixed_font_checker.stateChanged.connect(self.on_fixed_font_enabled_changed)
+        global_fntfmt_layout.addWidget(fixed_font_sublock, 4, 0, 1, 2)
+        
+        # Fixed Font Size
+        fixed_font_size_label = QLabel(self.tr('Fixed Font Size:'))
+        fixed_font_size_label.setFixedWidth(CONFIG_COMBOBOX_MIDEAN)
+        self.fixed_font_size_spinbox = QSpinBox()
+        self.fixed_font_size_spinbox.setMinimum(1)
+        self.fixed_font_size_spinbox.setMaximum(200)
+        self.fixed_font_size_spinbox.setValue(72)
+        self.fixed_font_size_spinbox.setFixedWidth(CONFIG_COMBOBOX_SHORT)
+        self.fixed_font_size_spinbox.valueChanged.connect(self.on_fixed_font_size_changed)
+        fixed_font_size_layout = QHBoxLayout()
+        fixed_font_size_layout.addWidget(fixed_font_size_label)
+        fixed_font_size_layout.addWidget(self.fixed_font_size_spinbox)
+        fixed_font_size_layout.addStretch()
+        fixed_font_size_widget = QWidget()
+        fixed_font_size_widget.setLayout(fixed_font_size_layout)
+        fixed_font_size_sublock = ConfigSubBlock(fixed_font_size_widget, self.tr('Fixed Font Size'))
+        global_fntfmt_layout.addWidget(fixed_font_size_sublock, 5, 0)
+        
+        # Fixed Font Family
+        fixed_font_family_label = QLabel(self.tr('Fixed Font Family:'))
+        fixed_font_family_label.setFixedWidth(CONFIG_COMBOBOX_MIDEAN)
+        self.fixed_font_family_edit = QLineEdit()
+        self.fixed_font_family_edit.setText("TH Sarabun New")
+        self.fixed_font_family_edit.setFixedWidth(CONFIG_COMBOBOX_LONG)
+        self.fixed_font_family_edit.editingFinished.connect(self.on_fixed_font_family_changed)
+        fixed_font_family_layout = QHBoxLayout()
+        fixed_font_family_layout.addWidget(fixed_font_family_label)
+        fixed_font_family_layout.addWidget(self.fixed_font_family_edit)
+        fixed_font_family_layout.addStretch()
+        fixed_font_family_widget = QWidget()
+        fixed_font_family_widget.setLayout(fixed_font_family_layout)
+        fixed_font_family_sublock = ConfigSubBlock(fixed_font_family_widget, self.tr('Fixed Font Family'))
+        global_fntfmt_layout.addWidget(fixed_font_family_sublock, 5, 1)
+
         global_fntfmt_layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding), 0, 2)
 
         self.let_autolayout_checker, sublock = generalConfigPanel.addCheckBox(self.tr('Auto layout'), 
@@ -463,8 +502,8 @@ class ConfigPanel(Widget):
         self.let_show_only_custom_fonts.stateChanged.connect(self.on_show_only_custom_fonts)
 
         generalConfigPanel.addTextLabel(label_save)
-        self.rst_imgformat_combobox, imsave_sublock = generalConfigPanel.addCombobox(['PNG', 'JPG', 'WEBP', 'JXL'], self.tr('Result image format'))
-        self.rst_imgformat_combobox.activated.connect(self.on_rst_imgformat_changed)
+        self.rst_imgformat_combobox, imsave_sublock = generalConfigPanel.addCombobox(['PNG', 'JPG'], self.tr('Image format'))
+        self.rst_imgformat_combobox.activated.connect(self.on_imgformat_changed)
         self.rst_imgquality_edit = PercentageLineEdit('100')
         self.rst_imgquality_edit.setFixedWidth(CONFIG_COMBOBOX_SHORT)
         self.rst_imgquality_edit.finish_edited.connect(self.on_edit_quality_changed)
@@ -473,9 +512,6 @@ class ConfigPanel(Widget):
         sublock.layout().setAlignment(Qt.AlignmentFlag.AlignLeft)
         sublock.layout().insertStretch(-1)
         imsave_sublock.layout().addWidget(sublock)
-
-        self.intermediate_imgformat_combobox, intermediate_imsave_sublock = generalConfigPanel.addCombobox(['PNG', 'JXL'], self.tr('Intermediate image format'))
-        self.intermediate_imgformat_combobox.activated.connect(self.on_intermediate_imgformat_changed)
 
         generalConfigPanel.addTextLabel(label_saladict)
 
@@ -553,11 +589,12 @@ class ConfigPanel(Widget):
         pcfg.let_textstyle_indep_flag = self.let_textstyle_indep_checker.isChecked()
         self.reload_textstyle.emit(pcfg.let_textstyle_indep_flag)
 
-    def on_rst_imgformat_changed(self):
-        pcfg.imgsave_ext = '.' + self.rst_imgformat_combobox.currentText().lower()
-
-    def on_intermediate_imgformat_changed(self):
-        pcfg.intermediate_imgsave_ext = '.' + self.intermediate_imgformat_combobox.currentText().lower()
+    def on_imgformat_changed(self):
+        ext = '.' + self.rst_imgformat_combobox.currentText().lower()
+        pcfg.imgsave_ext = ext
+        pcfg.intermediate_imgsave_ext = ext
+        pcfg.inpaint_imgsave_ext = ext
+        pcfg.mask_imgsave_ext = ext
 
     def on_edit_quality_changed(self, value: str):
         pcfg.imgsave_quality = int(value)
@@ -588,6 +625,15 @@ class ConfigPanel(Widget):
 
     def on_family_flag_changed(self):
         pcfg.let_family_flag = self.let_family_combox.currentIndex()
+
+    def on_fixed_font_enabled_changed(self):
+        pcfg.fixed_font_enabled = self.fixed_font_checker.isChecked()
+
+    def on_fixed_font_size_changed(self):
+        pcfg.fixed_font_size = float(self.fixed_font_size_spinbox.value())
+
+    def on_fixed_font_family_changed(self):
+        pcfg.fixed_font_family = self.fixed_font_family_edit.text()
 
     def on_effect_flag_changed(self):
         pcfg.let_fnteffect_flag = self.let_effect_combox.currentIndex()
@@ -636,14 +682,19 @@ class ConfigPanel(Widget):
         self.let_family_combox.setCurrentIndex(pcfg.let_family_flag)
         self.let_writing_mode_combox.setCurrentIndex(pcfg.let_writing_mode_flag)
         self.let_autolayout_checker.setChecked(pcfg.let_autolayout_flag)
+        self.fixed_font_checker.setChecked(pcfg.fixed_font_enabled)
+        self.fixed_font_size_spinbox.setValue(int(pcfg.fixed_font_size))
+        self.fixed_font_family_edit.setText(pcfg.fixed_font_family)
         self.selectext_minimenu_checker.setChecked(pcfg.textselect_mini_menu)
         self.let_uppercase_checker.setChecked(pcfg.let_uppercase_flag)
         self.let_textstyle_indep_checker.setChecked(pcfg.let_textstyle_indep_flag)
         self.saladict_shortcut.setKeySequence(pcfg.saladict_shortcut)
         self.searchurl_combobox.setCurrentText(pcfg.search_url)
         self.ocr_config_panel.restoreEmptyOCRChecker.setChecked(pcfg.restore_ocr_empty)
-        self.rst_imgformat_combobox.setCurrentText(pcfg.imgsave_ext.replace('.', '').upper())
-        self.intermediate_imgformat_combobox.setCurrentText(pcfg.intermediate_imgsave_ext.replace('.', '').upper())
+        self.ocr_config_panel.ocrModeComboBox.setCurrentText(pcfg.module.ocr_mode)
+        self.ocr_config_panel.ocrMaxBatchSpinBox.setValue(pcfg.module.ocr_max_batch)
+        result_format = pcfg.imgsave_ext.replace('.', '').upper()
+        self.rst_imgformat_combobox.setCurrentText(result_format if result_format in {'PNG', 'JPG'} else 'PNG')
         self.rst_imgquality_edit.setText(str(pcfg.imgsave_quality))
         self.load_model_checker.setChecked(pcfg.module.load_model_on_demand)
         self.empty_runcache_checker.setChecked(pcfg.module.empty_runcache)

@@ -123,7 +123,14 @@ class SizeComboBox(QComboBox):
 
     def setValue(self, value: float):
         value = min(self.max_val, max(self.min_val, value))
-        self.setCurrentText(str(round(value, 2)))
+        value_str = str(round(value, 2))
+        # Check if this value exists in the dropdown items
+        index = self.findText(value_str, Qt.MatchFlag.MatchExactly)
+        if index >= 0:
+            self.setCurrentIndex(index)
+        else:
+            # If not found, set as editable text (allows custom values)
+            self.setCurrentText(value_str)
 
     def changeByDelta(self, delta: float, multiplier = 0.01):
         if isinstance(multiplier, Callable):

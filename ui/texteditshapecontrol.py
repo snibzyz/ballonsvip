@@ -107,11 +107,9 @@ class ControlBlockItem(QGraphicsRectItem):
             else:
                 self.drag_mode = self.DRAG_ROTATE
                 self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-                preview = self.ctrl.previewPixmap
-
-                preview.setPixmap(blk_item.toPixmap().copy(blk_item.unpadRect(blk_item.boundingRect()).toRect()))
-                preview.setOpacity(0.7)
-                preview.setVisible(True)
+                # Do not draw dark preview overlay while rotating.
+                # It can visually cover the text area and look like a black fill.
+                self.ctrl.previewPixmap.setVisible(False)
                 rotate_vec = event.scenePos() - self.ctrl.sceneBoundingRect().center()
                 self.updateAngleLabelPos()
                 rotation = np.rad2deg(math.atan2(rotate_vec.y(), rotate_vec.x()))
@@ -301,7 +299,7 @@ class TextBlkShapeControl(QGraphicsRectItem):
             self.blk_item.endEdit()
 
     def paint(self, painter: QPainter, option: 'QStyleOptionGraphicsItem', widget = ...) -> None:
-        painter.setCompositionMode(QPainter.CompositionMode.RasterOp_NotDestination)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         super().paint(painter, option, widget)
 
     def hideControls(self):

@@ -12,6 +12,7 @@ import json
 
 import requests
 from PIL import Image, ImageFile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import betterproto
 
@@ -171,6 +172,18 @@ class OCRLensAPI_exp(OCRBase):
         "proxy": {
             "value": "",
             "description": 'Proxy (requests format: e.g., http://user:pass@host:port or {"http": ..., "https": ...})',
+        },
+        "ocr_mode": {
+            "type": "selector",
+            "options": ["sequence", "batch"],
+            "value": "sequence",
+            "description": "OCR mode: 'sequence' processes one by one, 'batch' processes multiple blocks concurrently.",
+        },
+        "batch_size": {
+            "type": "selector",
+            "options": [1, 2, 4, 6, 8, 10, 12, 16, 20],
+            "value": 4,
+            "description": "Max concurrent OCR requests when using batch mode (max 20).",
         },
         "description": "OCR using Google Lens Protobuf API (requests backend)",
     }
@@ -519,6 +532,19 @@ class OCRLensAPI_exp(OCRBase):
             self.logger.debug(
                 f"Image size: {im_h}x{im_w}. Processing {len(blk_list)} blocks."
             )
+        
+        # Get OCR mode
+        ocr_mode = self.get_param_value("ocr_mode")
+        if isinstance(ocr_mode, dict):
+            ocr_mode = ocr_mode.get("value", "sequence")
+        
+        if ocr_mode == "batch" and len(blk_list) > 1:
+            self._ocr_blk_list_batch(img, blk_list, im_h, im_w)
+        else:
+            self._ocr_blk_list_sequence(img, blk_list, im_h, im_w)
+    
+    def _ocr_blk_list_sequence(self, img: np.ndarray, blk_list: List[TextBlock], im_h: int, im_w: int):
+        """Process blocks one by one in sequence."""
         for i, blk in enumerate(blk_list):
             x1, y1, x2, y2 = blk.xyxy
             if self.debug_mode > 1:
@@ -550,6 +576,52 @@ class OCRLensAPI_exp(OCRBase):
                         f"Invalid/zero-area bbox {blk.xyxy} (clamped: {x1c,y1c,x2c,y2c})"
                     )
                 blk.text = ""
+    
+    def _ocr_blk_list_batch(self, img: np.ndarray, blk_list: List[TextBlock], im_h: int, im_w: int):
+        """Process blocks concurrently in batches."""
+        batch_size = self.get_param_value("batch_size")
+        if isinstance(batch_size, dict):
+            batch_size = batch_size.get("value", 4)
+        batch_size = min(20, max(1, int(batch_size)))
+        
+        if self.debug_mode:
+            self.logger.debug(f"Batch OCR mode with batch_size={batch_size}")
+        
+        # Prepare cropped images with their indices
+        crop_tasks = []
+        for i, blk in enumerate(blk_list):
+            x1, y1, x2, y2 = blk.xyxy
+            y1c, y2c = max(0, y1), min(im_h, y2)
+            x1c, x2c = max(0, x1), min(im_w, x2)
+            
+            if y1c < y2c and x1c < x2c:
+                cropped_img = img[y1c:y2c, x1c:x2c]
+                if cropped_img.size > 0:
+                    crop_tasks.append((i, cropped_img.copy()))
+                else:
+                    blk.text = ""
+            else:
+                blk.text = ""
+        
+        # Process in batches using ThreadPoolExecutor
+        def ocr_single(task):
+            idx, cropped = task
+            try:
+                return (idx, self.ocr(cropped))
+            except Exception as e:
+                if self.debug_mode:
+                    self.logger.error(f"Batch OCR error for block {idx}: {e}")
+                return (idx, "")
+        
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            futures = {executor.submit(ocr_single, task): task[0] for task in crop_tasks}
+            for future in as_completed(futures):
+                try:
+                    idx, text = future.result()
+                    blk_list[idx].text = text
+                except Exception as e:
+                    if self.debug_mode:
+                        self.logger.error(f"Future error: {e}")
 
     def _apply_no_uppercase(self, text: str) -> str:
         """Applies lowercase except for first letter of sentences."""

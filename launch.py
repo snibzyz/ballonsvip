@@ -6,6 +6,7 @@ import os
 import importlib
 import subprocess
 from platform import platform
+from pathlib import Path
 
 BRANCH = 'dev'
 VERSION = '1.4.0'
@@ -109,6 +110,46 @@ def commit_hash():
     return stored_commit_hash
 
 
+def current_branch():
+    try:
+        branch = run(f"{git} branch --show-current").strip()
+        if branch:
+            return branch
+    except Exception:
+        pass
+    return BRANCH
+
+
+def remote_ref_exists(remote_name: str, branch_name: str) -> bool:
+    try:
+        run(f"{git} ls-remote --exit-code --heads {remote_name} {branch_name}", errdesc=f"Failed to query {remote_name}/{branch_name}")
+        return True
+    except Exception:
+        return False
+
+
+def update_repository():
+    branch = current_branch()
+    remote = 'origin'
+    target_branch = branch if remote_ref_exists(remote, branch) else BRANCH
+    target_ref = f"{remote}/{target_branch}"
+
+    print(f'Checking for updates on {target_ref}...')
+
+    current_commit = commit_hash()
+    run(f"{git} fetch --depth 1 {remote} {target_branch}", desc=f"Fetching updates from {target_ref}...", errdesc=f"Failed to fetch updates from {target_ref}.")
+    latest_commit = run(f"{git} rev-parse {target_ref}").strip()
+
+    if current_commit == latest_commit:
+        print("No updates found.")
+        return
+
+    print(f"New updates found on {target_ref}. Updating repository...")
+    run(f"{git} pull --ff-only {remote} {target_branch}", desc=f"Updating repository from {target_ref}...", errdesc=f"Failed to update repository from {target_ref}.")
+    print("Repository updated. Restarting to apply updates...")
+    restart()
+
+
 BT = None
 APP = None
 
@@ -138,7 +179,7 @@ def main():
     print('Python version: ', sys.version)
     print('Python executable: ', sys.executable)
     print(f'Version: {VERSION}')
-    print(f'Branch: {BRANCH}')
+    print(f'Branch: {current_branch()}')
     print(f"Commit hash: {commit}")
 
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -153,20 +194,8 @@ def main():
         if getattr(sys, 'frozen', False):
             print('Running as app, skipping update.')
         else:
-            print('Checking for updates...')
             try:
-                current_commit = commit_hash()
-                run(f"{git} fetch origin {BRANCH}", desc="Fetching updates from git...", errdesc="Failed to fetch updates.")
-                latest_commit = run(f"{git} rev-parse origin/{BRANCH}").strip()
-
-                if current_commit != latest_commit:
-                    print("New updates found. Updating repository...")
-                    run(f"{git} pull origin {BRANCH}", desc="Updating repository...", errdesc="Failed to update repository.")
-                    print("Repository updated. Restarting to apply updates...")
-                    restart()
-                    return
-                else:
-                    print("No updates found.")
+                update_repository()
             except Exception as e:
                 print(f"Update check failed: {e}")
                 print("Continuing with the current version.")
@@ -214,6 +243,14 @@ def main():
 
     setup_logging(shared.LOGGING_PATH)
 
+    # Increase QImage allocation limit to support large images (default is 256MB)
+    # Set to 0 to disable limit, or set a higher value in MB
+    # This allows loading images larger than 256MB without rejection
+    if 'QT_IMAGEIO_MAXALLOC' not in os.environ:
+        os.environ['QT_IMAGEIO_MAXALLOC'] = '0'  # 0 = no limit
+    if 'QT_IMAGEIO_MAXALLOC_MB' not in os.environ:
+        os.environ['QT_IMAGEIO_MAXALLOC_MB'] = '0'  # 0 = no limit
+
     app_args = sys.argv
     if args.headless:
         app_args = sys.argv + ['-platform', 'offscreen']
@@ -234,14 +271,8 @@ def main():
         shared.SCREEN_W = ps.geometry().width()
         shared.SCREEN_H = ps.geometry().height()
 
-    lang = config.display_lang
-    langp = osp.join(shared.TRANSLATE_DIR, lang + '.qm')
-    if osp.exists(langp):
-        translator = QTranslator()
-        translator.load(lang, osp.dirname(osp.abspath(__file__)) + "/translate")
-        app.installTranslator(translator)
-    elif lang not in ('en_US', 'English'):
-        LOGGER.warning(f'target display language file {langp} doesnt exist.')
+    # Force English language to avoid file lookup overhead
+    lang = 'English'
     LOGGER.info(f'set display language to {lang}')
 
     # Fonts

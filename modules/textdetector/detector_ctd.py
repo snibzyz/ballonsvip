@@ -32,7 +32,25 @@ class ComicTextDetector(TextDetectorBase):
         'font size multiplier': 1.,
         'font size max': -1,
         'font size min': -1,
-        'mask dilate size': 2
+        'mask dilate size': 2,
+        'distance_tolerance': {
+            'type': 'line_editor',
+            'value': 1.2,
+            'description': 'Max distance factor (relative to font size) to merge text blocks. Higher = merge further blocks.',
+            'display_name': 'Merge Distance Tolerance'
+        },
+        'font_size_tolerance': {
+            'type': 'line_editor',
+            'value': 1.7,
+            'description': 'Max font size ratio difference to merge text blocks.',
+            'display_name': 'Merge Font Size Tolerance'
+        },
+        'block_expansion_ratio': {
+            'type': 'line_editor',
+            'value': 0.3,
+            'description': 'Expand text block bounding box by this ratio (0.3 = 30%). Set to 0 to disable.',
+            'display_name': 'Block Expansion Ratio'
+        }
     }
     _load_model_keys = {'model'}
     download_file_list = [{
@@ -63,7 +81,9 @@ class ComicTextDetector(TextDetectorBase):
             self.model = load_ctd_model(CTD_ONNX_PATH, self.device, self.detect_size)
 
     def _detect(self, img: np.ndarray, proj: ProjImgTrans) -> Tuple[np.ndarray, List[TextBlock]]:
-        _, mask, blk_list = self.model(img)
+        dist_tol = float(self.params['distance_tolerance']['value'])
+        fnt_tol = float(self.params['font_size_tolerance']['value'])
+        _, mask, blk_list = self.model(img, distance_tolerance=dist_tol, font_size_tolerance=fnt_tol)
         
         fnt_rsz = self.get_param_value('font size multiplier')
         fnt_max = self.get_param_value('font size max')
@@ -81,6 +101,26 @@ class ComicTextDetector(TextDetectorBase):
         if ksize > 0:
             element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ksize + 1, 2 * ksize + 1),(ksize, ksize))
             mask = cv2.dilate(mask, element)
+
+        # Expand text block bounding boxes from center
+        expansion_ratio = float(self.params['block_expansion_ratio']['value'])
+        if expansion_ratio > 0:
+            im_h, im_w = img.shape[:2]
+            for blk in blk_list:
+                x1, y1, x2, y2 = blk.xyxy
+                w = x2 - x1
+                h = y2 - y1
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                new_w = w * (1 + expansion_ratio)
+                new_h = h * (1 + expansion_ratio)
+                new_x1 = int(max(0, cx - new_w / 2))
+                new_y1 = int(max(0, cy - new_h / 2))
+                new_x2 = int(min(im_w, cx + new_w / 2))
+                new_y2 = int(min(im_h, cy + new_h / 2))
+                blk.xyxy = [new_x1, new_y1, new_x2, new_y2]
+                # Set _bounding_rect as [x, y, w, h] for UI rendering
+                blk._bounding_rect = [new_x1, new_y1, new_x2 - new_x1, new_y2 - new_y1]
 
         return mask, blk_list
 

@@ -14,6 +14,9 @@ class TextShadowGroup(QGroupBox):
 
         self.xoffset_box = SmallSizeComboBox([-2, 2], 'shadow_xoffset', self)
         self.xoffset_box.setToolTip(self.tr("Set X offset"))
+        # Add quick number options for dropdown
+        quick_offset_values = [str(v) for v in [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]]
+        self.xoffset_box.addItems(quick_offset_values)
         self.xoffset_box.param_changed.connect(self.on_offset_changed)
         self.xoffset_label = SmallSizeControlLabel(self, direction=1, text='X', alignment=Qt.AlignmentFlag.AlignCenter)
         self.xoffset_label.size_ctrl_changed.connect(self.xoffset_box.changeByDelta)
@@ -24,6 +27,9 @@ class TextShadowGroup(QGroupBox):
 
         self.yoffset_box = SmallSizeComboBox([-2, 2], 'shadow_yoffset', self)
         self.yoffset_box.setToolTip(self.tr("Set Y offset"))
+        # Add quick number options for dropdown
+        quick_offset_values = [str(v) for v in [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]]
+        self.yoffset_box.addItems(quick_offset_values)
         self.yoffset_box.param_changed.connect(self.on_offset_changed)
         self.yoffset_label = SmallSizeControlLabel(self, direction=1, text='Y', alignment=Qt.AlignmentFlag.AlignCenter)
         self.yoffset_label.size_ctrl_changed.connect(self.yoffset_box.changeByDelta)
@@ -36,6 +42,9 @@ class TextShadowGroup(QGroupBox):
 
         self.strength_box = SmallSizeComboBox([0, 3], 'shadow_strength', self)
         self.strength_box.setToolTip(self.tr("Set Shadow Strength"))
+        # Add quick number options for dropdown
+        quick_strength_values = [str(v) for v in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]]
+        self.strength_box.addItems(quick_strength_values)
         self.strength_box.param_changed.connect(self.on_param_changed)
         self.strength_label = SmallSizeControlLabel(self, direction=1, text=self.tr('Strength'), alignment=Qt.AlignmentFlag.AlignCenter)
         self.strength_label.size_ctrl_changed.connect(lambda x : self.strength_box.changeByDelta(x, multiplier=0.03))
@@ -46,6 +55,9 @@ class TextShadowGroup(QGroupBox):
 
         self.radius_box = SmallSizeComboBox([0, 2], 'shadow_radius', self)
         self.radius_box.setToolTip(self.tr("Set Shadow Radius"))
+        # Add quick number options for dropdown
+        quick_radius_values = [str(v) for v in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]]
+        self.radius_box.addItems(quick_radius_values)
         self.radius_box.param_changed.connect(self.on_param_changed)
         self.radius_label = SmallSizeControlLabel(self, direction=1, text=self.tr('Radius'), alignment=Qt.AlignmentFlag.AlignCenter)
         self.radius_label.size_ctrl_changed.connect(self.radius_box.changeByDelta)
@@ -101,6 +113,9 @@ class TextGradientGroup(QGroupBox):
 
         self.angle_box = SmallSizeComboBox([0, 359], 'gradient_angle', self)
         self.angle_box.setToolTip(self.tr("Set Gradient Angle"))
+        # Add quick number options for dropdown (common angles)
+        quick_angle_values = [str(v) for v in [0, 45, 90, 135, 180, 225, 270, 315]]
+        self.angle_box.addItems(quick_angle_values)
         self.angle_box.param_changed.connect(self.on_param_changed)
         self.angle_label = SmallSizeControlLabel(self, direction=1, text=self.tr('Angle'), alignment=Qt.AlignmentFlag.AlignCenter)
         self.angle_label.size_ctrl_changed.connect(lambda x : self.angle_box.changeByDelta(x, multiplier=1))
@@ -111,6 +126,9 @@ class TextGradientGroup(QGroupBox):
 
         self.size_box = SmallSizeComboBox([0.5, 2], 'gradient_size', self)
         self.size_box.setToolTip(self.tr("Set Gradient Size"))
+        # Add quick number options for dropdown
+        quick_size_values = [str(v) for v in [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]]
+        self.size_box.addItems(quick_size_values)
         self.size_box.param_changed.connect(self.on_param_changed)
         self.size_label = SmallSizeControlLabel(self, direction=1, text=self.tr('Size'), alignment=Qt.AlignmentFlag.AlignCenter)
         self.size_label.size_ctrl_changed.connect(lambda x : self.size_box.changeByDelta(x, multiplier=0.02))
@@ -159,6 +177,9 @@ class TextAdvancedFormatPanel(PanelArea):
 
         self.opacity_box = SmallSizeComboBox([0, 1], 'opacity', self, init_value=1.)
         self.opacity_box.setToolTip(self.tr("Set Text Opacity"))
+        # Add quick number options for dropdown
+        quick_opacity_values = [str(v) for v in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]]
+        self.opacity_box.addItems(quick_opacity_values)
         self.opacity_box.param_changed.connect(self.on_format_changed)
         self.opacity_label = SmallSizeControlLabel(self, direction=1, text=self.tr('Opacity'), alignment=Qt.AlignmentFlag.AlignCenter)
         self.opacity_label.size_ctrl_changed.connect(self.opacity_box.changeByDelta)

@@ -312,7 +312,7 @@ class TextDetector:
         return lines, mask
 
     @torch.no_grad()
-    def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False) -> Tuple[np.ndarray, np.ndarray, List[TextBlock]]:
+    def __call__(self, img, refine_mode=REFINEMASK_INPAINT, keep_undetected_mask=False, distance_tolerance=1.5, font_size_tolerance=1.7) -> Tuple[np.ndarray, np.ndarray, List[TextBlock]]:
         
         detect_size = self.detect_size if not self.backend == 'opencv' else 1024
         im_h, im_w = img.shape[:2]
@@ -345,7 +345,7 @@ class TextDetector:
             lines = []
         else:
             lines = lines.astype(np.int64)
-        blk_list = group_output([], lines, im_w, im_h, mask, canvas=img)
+        blk_list = group_output([], lines, im_w, im_h, mask, canvas=img, distance_tolerance=distance_tolerance, font_size_tolerance=font_size_tolerance)
         # print(lines)
         # blk_list = mit_merge_textlines(lines, im_w, im_w)
         mask_refined = refine_mask(img, mask, blk_list, refine_mode=refine_mode)

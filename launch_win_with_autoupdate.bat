@@ -33,7 +33,7 @@ goto :show_stdout_stderr
 
 
 :launch
-%PYTHON% launch.py --update  %*
+%PYTHON% launch.py --update %*
 pause
 exit /b
 

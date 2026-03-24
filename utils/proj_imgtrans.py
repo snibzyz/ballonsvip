@@ -3,6 +3,7 @@ from docx.shared import Inches
 from docx import Document
 import piexif.helper
 import numpy as np
+import os
 import os.path as osp
 from typing import Tuple, Union, List, Dict
 from PIL import Image
@@ -32,6 +33,23 @@ def get_last_modified_file(file_prefix, exts, ext_fallback=None):
         else:
             latest_f = file_prefix + exts[0]
     return latest_f
+
+
+def remove_sibling_image_files(file_prefix, keep_ext):
+    keep_ext = keep_ext.lower()
+    for ext in ['.png', '.jpg', '.jpeg', '.webp', '.jxl']:
+        if ext == keep_ext:
+            continue
+        stale_path = file_prefix + ext
+        if osp.exists(stale_path):
+            try:
+                os.remove(stale_path)
+            except Exception as e:
+                LOGGER.warning(f'Failed to remove stale image file {stale_path}: {e}')
+
+
+def image_ext(path: str) -> str:
+    return osp.splitext(path)[1].lower()
 
 
 def write_jpg_metadata(imgpath: str, metadata="a metadata"):
@@ -124,6 +142,9 @@ class ProjImgTrans:
 
     def load(self, directory: str, json_path: str = None) -> bool:
         self.directory = directory
+        self.new_pages = []
+        self.not_found_pages = {}
+        self._fuzzy_inpainted_list = None
         if json_path is None:
             self.proj_path = osp.join(self.directory, self.proj_name() + '.json')
         else:
@@ -152,16 +173,24 @@ class ProjImgTrans:
     def inpainted_dir(self):
         return osp.join(self.directory, 'inpainted')
 
+    def legacy_inpaint_dirs(self):
+        return [
+            osp.join(self.directory, 'inpaint'),
+            osp.join(self.directory, 'Inpaint'),
+        ]
+
     def result_dir(self):
         return osp.join(self.directory, 'result')
 
     def load_from_dict(self, proj_dict: dict):
         self.set_current_img(None)
+        self.new_pages = []
+        self.not_found_pages = {}
+        self._fuzzy_inpainted_list = None
         try:
             self.pages = {}
             self._pagename2idx = {}
             self._idx2pagename = {}
-            self.not_found_pages = {}
             page_dict = proj_dict['pages']
             not_found_pages = list(page_dict.keys())
             found_pages = find_all_imgs(img_dir=self.directory, abs_path=False, sort=True)
@@ -365,10 +394,30 @@ class ProjImgTrans:
         return img
 
     def save_mask(self, img_name, mask: np.ndarray):
-        imwrite(self.get_mask_path(img_name), mask, ext=pcfg.intermediate_imgsave_ext)
+        remove_sibling_image_files(osp.join(self.mask_dir(), osp.splitext(img_name)[0]), pcfg.imgsave_ext)
+        imwrite(self.get_mask_path(img_name), mask, ext=pcfg.imgsave_ext, quality=pcfg.imgsave_quality)
 
     def save_inpainted(self, img_name, inpainted: np.ndarray):
-        imwrite(self.get_inpainted_path(img_name), inpainted, ext=pcfg.intermediate_imgsave_ext)
+        remove_sibling_image_files(osp.join(self.inpainted_dir(), osp.splitext(img_name)[0]), pcfg.imgsave_ext)
+        imwrite(self.get_inpainted_path(img_name), inpainted, ext=pcfg.imgsave_ext, quality=pcfg.imgsave_quality)
+
+    def _intermediate_ext_candidates(self) -> List[str]:
+        exts = []
+        for ext in [pcfg.imgsave_ext, pcfg.intermediate_imgsave_ext, pcfg.inpaint_imgsave_ext, pcfg.mask_imgsave_ext, '.png', '.jpg', '.jpeg', '.webp', '.jxl']:
+            if ext and ext not in exts:
+                exts.append(ext)
+        return exts
+
+    def _convert_output_to_current_format(self, loaded_path: str, target_path: str, img: np.ndarray, grayscale: bool = False):
+        if loaded_path is None or not osp.exists(loaded_path):
+            return
+        if image_ext(loaded_path) == pcfg.imgsave_ext and osp.normpath(loaded_path) == osp.normpath(target_path):
+            return
+
+        stem = osp.splitext(target_path)[0]
+        remove_sibling_image_files(stem, pcfg.imgsave_ext)
+        imwrite(target_path, img, ext=pcfg.imgsave_ext, quality=pcfg.imgsave_quality)
+        LOGGER.info(f'Converted {loaded_path} to {target_path} using current image format setting')
 
     def current_img_path(self) -> str:
         if self.current_img is None:
@@ -381,9 +430,9 @@ class ProjImgTrans:
 
         fileprefix = osp.join(self.mask_dir(), osp.splitext(imgname)[0])
         if get_last_modified:
-            p = get_last_modified_file(fileprefix, ['.jxl', '.png'], ext_fallback=pcfg.intermediate_imgsave_ext)
+            p = get_last_modified_file(fileprefix, self._intermediate_ext_candidates(), ext_fallback=pcfg.imgsave_ext)
         else:
-            p = fileprefix+pcfg.intermediate_imgsave_ext
+            p = fileprefix+pcfg.imgsave_ext
 
         return p
     
@@ -392,33 +441,51 @@ class ProjImgTrans:
         mp = self.get_mask_path(imgname, get_last_modified=True)
         if osp.exists(mp):
             mask = imread(mp, cv2.IMREAD_GRAYSCALE)
+            self._convert_output_to_current_format(mp, self.get_mask_path(imgname, get_last_modified=False), mask, grayscale=True)
         return mask
 
     def get_inpainted_path(self, imgname: str = None, get_last_modified=False) -> str:
         if imgname is None:
             imgname = self.current_img
 
-        fileprefix = osp.join(self.inpainted_dir(), osp.splitext(imgname)[0])
+        stem = osp.splitext(imgname)[0]
+        primary_prefix = osp.join(self.inpainted_dir(), stem)
         if get_last_modified:
-            p = get_last_modified_file(fileprefix, ['.jxl', '.png'], ext_fallback=pcfg.intermediate_imgsave_ext)
-        else:
-            p = fileprefix+pcfg.intermediate_imgsave_ext
+            prefixes = [primary_prefix]
+            prefixes.extend([osp.join(d, stem) for d in self.legacy_inpaint_dirs() if osp.exists(d)])
 
-        if not osp.exists(p) and shared.FUZZY_MATCH_IMAGE_NAME:
+            latest_time = -1
+            latest_path = None
+            for prefix in prefixes:
+                candidate = get_last_modified_file(prefix, self._intermediate_ext_candidates(), ext_fallback=pcfg.imgsave_ext)
+                if osp.exists(candidate):
+                    mtime = osp.getmtime(candidate)
+                    if mtime > latest_time:
+                        latest_time = mtime
+                        latest_path = candidate
+            if latest_path is not None:
+                p = latest_path
+            else:
+                p = primary_prefix + pcfg.imgsave_ext
+        else:
+            p = primary_prefix + pcfg.imgsave_ext
+
+        if not osp.exists(p):
             if self._fuzzy_inpainted_list is None:
-                if osp.exists(self.inpainted_dir()):
-                    self._fuzzy_inpainted_list = find_all_imgs(self.inpainted_dir(), sort=True)
-                else:
-                    self._fuzzy_inpainted_list = []
+                self._fuzzy_inpainted_list = []
+                for inpaint_dir in [self.inpainted_dir(), *self.legacy_inpaint_dirs()]:
+                    if osp.exists(inpaint_dir):
+                        self._fuzzy_inpainted_list.extend([osp.join(inpaint_dir, f) for f in find_all_imgs(inpaint_dir, sort=True)])
             pidx = self.pagename2idx(imgname)
             if pidx < len(self._fuzzy_inpainted_list):
-                return osp.join(self.inpainted_dir(), self._fuzzy_inpainted_list[pidx])
+                return self._fuzzy_inpainted_list[pidx]
         return p
     
     def load_inpainted_by_imgname(self, imgname: str, scale_to_src: bool = True) -> np.ndarray:
         inpainted = None
         mp = self.get_inpainted_path(imgname, get_last_modified=True)
         if mp is not None and osp.exists(mp):
+            LOGGER.info(f'Loading inpainted image for {imgname} from {mp}')
             inpainted = imread(mp)
             if imgname == self.current_img and self.img_array is not None:
                 h, w = self.img_array.shape[:2]
@@ -429,6 +496,9 @@ class ProjImgTrans:
             if ih != h or iw != w:
                 inpainted = Image.fromarray(inpainted).resize((w, h), resample=Image.Resampling.LANCZOS)
                 inpainted = np.array(inpainted)
+            self._convert_output_to_current_format(mp, self.get_inpainted_path(imgname, get_last_modified=False), inpainted)
+        else:
+            LOGGER.info(f'No inpainted image found for {imgname}; using source image as base')
         return inpainted
 
     def get_result_path(self, imgname: str) -> str:
@@ -439,6 +509,17 @@ class ProjImgTrans:
             else:
                 ext = pcfg.imgsave_ext
         return osp.join(self.result_dir(), osp.splitext(imgname)[0]+ext)
+
+    def cleanup_stale_output_files(self, imgname: str, targets=None):
+        if targets is None:
+            targets = {'mask', 'inpainted', 'result'}
+        stem = osp.splitext(imgname)[0]
+        if 'mask' in targets:
+            remove_sibling_image_files(osp.join(self.mask_dir(), stem), pcfg.imgsave_ext)
+        if 'inpainted' in targets:
+            remove_sibling_image_files(osp.join(self.inpainted_dir(), stem), pcfg.imgsave_ext)
+        if 'result' in targets:
+            remove_sibling_image_files(osp.join(self.result_dir(), stem), pcfg.imgsave_ext)
         
     def backup(self):
         raise NotImplementedError

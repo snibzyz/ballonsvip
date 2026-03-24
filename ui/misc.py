@@ -2,7 +2,7 @@ import cv2, re, json, os
 from pathlib import Path
 import numpy as np
 import os.path as osp
-from qtpy.QtGui import QPixmap,  QColor, QImage, QTextDocument, QTextCursor
+from qtpy.QtGui import QPixmap,  QColor, QImage, QTextDocument, QTextCursor, QFont
 from qtpy.QtCore import Qt, QPointF
 
 from utils import shared as C
@@ -113,6 +113,47 @@ def set_html_color(html, rgb):
     
 def set_html_family(html, family):
     return ffamily_pattern.sub(f'font-family:\'{family}\'', html)
+
+
+def apply_fontformat_to_html(html, ffmat):
+    if not html:
+        return html
+
+    doc = QTextDocument()
+    doc.setHtml(html)
+
+    cursor = QTextCursor(doc)
+    cursor.select(QTextCursor.SelectionType.Document)
+    char_format = cursor.charFormat()
+    font = doc.defaultFont()
+
+    font.setFamily(ffmat.font_family)
+    font.setPointSizeF(ffmat.size_pt)
+    font.setBold(ffmat.bold)
+
+    font_weight = ffmat.font_weight
+    if font_weight is None:
+        font_weight = font.weight()
+    if not ffmat.bold:
+        char_format.setFontWeight(font_weight)
+
+    char_format.setFont(font)
+    char_format.setForeground(QColor(*ffmat.foreground_color()))
+    char_format.setFontItalic(ffmat.italic)
+    char_format.setFontUnderline(ffmat.underline)
+    if not ffmat.vertical:
+        char_format.setFontLetterSpacingType(QFont.SpacingType.PercentageSpacing)
+        char_format.setFontLetterSpacing(ffmat.letter_spacing * 100)
+
+    cursor.setCharFormat(char_format)
+    cursor.setBlockCharFormat(char_format)
+
+    alignment_qt_flag = [Qt.AlignmentFlag.AlignLeft, Qt.AlignmentFlag.AlignCenter, Qt.AlignmentFlag.AlignRight][ffmat.alignment]
+    text_option = doc.defaultTextOption()
+    text_option.setAlignment(alignment_qt_flag)
+    doc.setDefaultTextOption(text_option)
+
+    return doc.toHtml()
 
 def html_max_fontsize(html:  str) -> float:
     size_list = fontsize_pattern.findall(html)

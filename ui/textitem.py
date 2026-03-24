@@ -18,7 +18,6 @@ from .text_graphical_effect import apply_shadow_effect
 TEXTRECT_SHOW_COLOR = QColor(30, 147, 229, 170)
 TEXTRECT_SELECTED_COLOR = QColor(248, 64, 147, 170)
 
-
 class TextBlkItem(QGraphicsTextItem):
 
     begin_edit = Signal(int)
@@ -461,13 +460,13 @@ class TextBlkItem(QGraphicsTextItem):
             self._draw_accessories(painter)
 
         option.state = QStyle.State_None
+        option.palette.setBrush(QPalette.ColorRole.Highlight, QBrush(Qt.GlobalColor.transparent))
         super().paint(painter, option, widget)
 
         if not self.is_editting():
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOver)
             self._draw_accessories(painter)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
 
     def _draw_accessories(self, painter: QPainter):
         br = self.boundingRect()
@@ -477,17 +476,18 @@ class TextBlkItem(QGraphicsTextItem):
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawPixmap(br.toRect(), self.background_pixmap)
 
-        draw_rect = self.draw_rect and not self.under_ctrl
+        # Show bounding box if draw_rect is enabled
+        # Selected blocks show pink dashed box, unselected blocks show blue solid box
+        # under_ctrl is only used for shape control operations, not for bounding box display
         if self.isSelected() and not self.is_editting():
             pen = QPen(TEXTRECT_SELECTED_COLOR, 3.5 / self.get_scale(), Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.drawRect(self.unpadRect(br))
-        elif draw_rect:
+        elif self.draw_rect and not self.is_editting():
             pen = QPen(TEXTRECT_SHOW_COLOR, 3 / self.get_scale(), Qt.PenStyle.SolidLine)
             painter.setPen(pen)
             painter.drawRect(self.unpadRect(br))
         painter.restore()
-
 
     def startEdit(self, pos: QPointF = None) -> None:
         self.pre_editing = False
@@ -1033,7 +1033,14 @@ class TextBlkItem(QGraphicsTextItem):
         self.old_ffmt_values = {}
         self.old_ffmt_values[attr_name] = self.fontformat[attr_name]
         setattr(self.fontformat, attr_name, value)
-        self.setGradientEnabled(self.fontformat.gradient_enabled)
+        # Always refresh gradient if enabled, or if we're changing gradient_enabled itself
+        if self.fontformat.gradient_enabled or attr_name == 'gradient_enabled':
+            self.setGradientEnabled(self.fontformat.gradient_enabled, repaint_background=True)
+        else:
+            # If gradient is disabled but we're changing colors/attributes, just update the format
+            # The gradient will be applied when enabled later
+            self.repaint_background()
+            self.update()
         self.old_ffmt_values = None
 
     def setOpacity(self, opacity: float):

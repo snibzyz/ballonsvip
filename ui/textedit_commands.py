@@ -203,18 +203,20 @@ class SqueezeCommand(QUndoCommand):
                 self.ctrl.updateBoundingRect()
 
 class ResetAngleCommand(QUndoCommand):
-    def __init__(self, blkitem_lst: List[TextBlkItem], ctrl: TextBlkShapeControl):
+    def __init__(self, blkitem_lst: List[TextBlkItem], ctrl: TextBlkShapeControl, reset_all: bool = False):
         super(ResetAngleCommand, self).__init__()
-        self.blkitem_lst = blkitem_lst
         self.angle_lst = []
         self.ctrl = ctrl
-        blkitem_lst = []
-        for blk in self.blkitem_lst:
-            rotation = blk.rotation()
-            if rotation != 0:
-                self.angle_lst.append(rotation)
-                blkitem_lst.append(blk)
-        self.blkitem_lst = blkitem_lst
+        self.reset_all = reset_all
+        # Filter only blocks that have non-zero angle (unless reset_all is True)
+        # Use blk.angle (from TextBlock data) instead of blk.rotation() (Qt rotation)
+        filtered_blkitem_lst = []
+        for blk in blkitem_lst:
+            angle = blk.angle  # Use blk.angle property which returns blk.blk.angle
+            if reset_all or angle != 0:
+                self.angle_lst.append(angle)
+                filtered_blkitem_lst.append(blk)
+        self.blkitem_lst = filtered_blkitem_lst
     
     def redo(self):
         for blk in self.blkitem_lst:

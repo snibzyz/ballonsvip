@@ -7,7 +7,7 @@ from .custom_widget import ConfigComboBox, ParamComboBox, NoBorderPushBtn, Param
 from utils.shared import CONFIG_COMBOBOX_LONG, size2width, CONFIG_COMBOBOX_SHORT, CONFIG_COMBOBOX_HEIGHT
 from utils.config import pcfg
 
-from qtpy.QtWidgets import QPlainTextEdit, QHBoxLayout, QVBoxLayout, QWidget, QLabel, QCheckBox, QLineEdit, QGridLayout, QPushButton
+from qtpy.QtWidgets import QPlainTextEdit, QHBoxLayout, QVBoxLayout, QWidget, QLabel, QCheckBox, QLineEdit, QGridLayout, QPushButton, QComboBox, QSpinBox
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QDoubleValidator
 
@@ -457,9 +457,44 @@ class OCRConfigPanel(ModuleConfigParseWidget):
         self.fontDetectChecker.setChecked(pcfg.module.ocr_font_detect)
         self.fontDetectChecker.clicked.connect(self.on_fontdetect_changed)
         self.vlayout.addWidget(self.fontDetectChecker)
+        
+        # OCR processing mode
+        ocr_mode_layout = QHBoxLayout()
+        ocr_mode_label = QLabel(self.tr("OCR Processing Mode:"), self)
+        self.ocrModeComboBox = QComboBox(self)
+        self.ocrModeComboBox.addItems(['queue', 'batch'])
+        self.ocrModeComboBox.setCurrentText(pcfg.module.ocr_mode)
+        self.ocrModeComboBox.currentTextChanged.connect(self.on_ocr_mode_changed)
+        ocr_mode_layout.addWidget(ocr_mode_label)
+        ocr_mode_layout.addWidget(self.ocrModeComboBox)
+        ocr_mode_layout.addStretch()
+        ocr_mode_widget = QWidget(self)
+        ocr_mode_widget.setLayout(ocr_mode_layout)
+        self.vlayout.addWidget(ocr_mode_widget)
+        
+        # Max batch size
+        max_batch_layout = QHBoxLayout()
+        max_batch_label = QLabel(self.tr("Max Batch Size:"), self)
+        self.ocrMaxBatchSpinBox = QSpinBox(self)
+        self.ocrMaxBatchSpinBox.setMinimum(1)
+        self.ocrMaxBatchSpinBox.setMaximum(1000)
+        self.ocrMaxBatchSpinBox.setValue(pcfg.module.ocr_max_batch)
+        self.ocrMaxBatchSpinBox.valueChanged.connect(self.on_ocr_max_batch_changed)
+        max_batch_layout.addWidget(max_batch_label)
+        max_batch_layout.addWidget(self.ocrMaxBatchSpinBox)
+        max_batch_layout.addStretch()
+        max_batch_widget = QWidget(self)
+        max_batch_widget.setLayout(max_batch_layout)
+        self.vlayout.addWidget(max_batch_widget)
 
     def on_restore_empty_ocr(self):
         pcfg.restore_ocr_empty = self.restoreEmptyOCRChecker.isChecked()
 
     def on_fontdetect_changed(self):
         pcfg.module.ocr_font_detect = self.fontDetectChecker.isChecked()
+    
+    def on_ocr_mode_changed(self, mode: str):
+        pcfg.module.ocr_mode = mode
+    
+    def on_ocr_max_batch_changed(self, value: int):
+        pcfg.module.ocr_max_batch = value

@@ -28,6 +28,7 @@ config/config.json
 localtmp*
 
 .vscode
+.cursor/
 .VSCodeCounter
 .idea
 *.zip

@@ -14,8 +14,6 @@ from .textitem import TextBlkItem
 global_default_set_kwargs = dict(set_selected=False, restore_cursor=False)
 local_default_set_kwargs = dict(set_selected=True, restore_cursor=True)
 
-
-
 class TextStyleUndoCommand(QUndoCommand):
 
     def __init__(self, style_func: Callable, params: Dict, redo_values: List, undo_values: List):
@@ -30,7 +28,6 @@ class TextStyleUndoCommand(QUndoCommand):
 
     def undo(self) -> None:
         self.style_func(values=self.undo_values, **self.params)
-
 
 def wrap_fntformat_input(values: str, blkitems: List[TextBlkItem], is_global: bool):
     if is_global:
@@ -171,18 +168,15 @@ def ffmt_change_line_spacing_type(param_name: str, values: float, act_ffmt: Font
     for blkitem, value in zip(blkitems, values):
         blkitem.setLineSpacingType(value, restore_cursor=restore_cursor)
 
-
 @font_formating(push_undostack=True)
 def ffmt_change_shadow_offset(param_name: str, values: float, act_ffmt: FontFormat, is_global: bool, blkitems: List[TextBlkItem], **kwargs):
     for blkitem, value in zip(blkitems, values):
         blkitem.setBGAttribute(param_name, value)
 
-
 @font_formating()
 def ffmt_change_gradient_enabled(param_name: str, values: float, act_ffmt: FontFormat, is_global: bool, blkitems: List[TextBlkItem], **kwargs):
     for blkitem, value in zip(blkitems, values):
         blkitem.setGradientAttribute(param_name, value)
-
 
 ffmt_change_shadow_radius = ffmt_change_shadow_offset
 ffmt_change_shadow_strength = ffmt_change_shadow_offset

@@ -611,7 +611,7 @@ def examine_textblk(blk: TextBlock, im_w: int, im_h: int, sort: bool = False) ->
     if sort:
         blk.sort_lines()
 
-def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distance_tol=2, canvas=None) -> bool:
+def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distance_tol=1.2, canvas=None) -> bool:
     if blk2.merged:
         return False
     fntsize_div = blk.font_size / blk2.font_size
@@ -638,19 +638,16 @@ def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distanc
         if blk.vertical:
             if distance_y > 0:
                 return False
-            if distance_x > fntsz_avg * 0.8:
+            if distance_x > fntsz_avg * distance_tol:
                 return False
-            if abs(distance_y) / min(h1, h2) < 0.4:
+            if abs(distance_y) / min(h1, h2) < 0.4 / distance_tol * 0.8:
                 return False
         else:
             if distance_x > 0:
                 return False
-            fntsz_thr = 0.5
-            if fntsz_avg < 24:
-                fntsz_thr = 0.6
-            if distance_y > fntsz_avg * fntsz_thr:
+            if distance_y > fntsz_avg * distance_tol:
                 return False
-            if abs(distance_x) / min(w1, w2) < 0.3:
+            if abs(distance_x) / min(w1, w2) < 0.3 / distance_tol * 0.6:
                 return False
         if fntsize_div > fntsize_tol or 1 / fntsize_div > fntsize_tol:
             return False
@@ -672,7 +669,7 @@ def try_merge_textline(blk: TextBlock, blk2: TextBlock, fntsize_tol=1.7, distanc
     blk2.merged = True
     return True
 
-def merge_textlines(blk_list: List[TextBlock], canvas=None, fntsize_tol=1.7) -> List[TextBlock]:
+def merge_textlines(blk_list: List[TextBlock], canvas=None, fntsize_tol=1.7, distance_tol=1.2) -> List[TextBlock]:
     if len(blk_list) < 2:
         return blk_list
     merged_list = []
@@ -680,7 +677,7 @@ def merge_textlines(blk_list: List[TextBlock], canvas=None, fntsize_tol=1.7) -> 
         if current_blk.merged:
             continue
         for jj, blk in enumerate(blk_list[ii+1:]):
-            try_merge_textline(current_blk, blk, canvas=canvas, fntsize_tol=fntsize_tol)
+            try_merge_textline(current_blk, blk, canvas=canvas, fntsize_tol=fntsize_tol, distance_tol=distance_tol)
         merged_list.append(current_blk)
     for blk in merged_list:
         blk.adjust_bbox(with_bbox=False)
@@ -717,7 +714,7 @@ def split_textblk(blk: TextBlock):
             current_blk.adjust_bbox(with_bbox=False)
     return textblock_splitted, sub_blk_list
 
-def group_output(blks, lines, im_w, im_h, mask=None, sort_blklist=True, canvas=None) -> List[TextBlock]:
+def group_output(blks, lines, im_w, im_h, mask=None, sort_blklist=True, canvas=None, distance_tolerance=1.2, font_size_tolerance=1.7) -> List[TextBlock]:
     blk_list: List[TextBlock] = []
     scattered_lines = {'ver': [], 'hor': []}
     for bbox, cls, conf in zip(*blks):
@@ -800,8 +797,9 @@ def group_output(blks, lines, im_w, im_h, mask=None, sort_blklist=True, canvas=N
     scattered_lines['hor'].sort(key=lambda blk: blk.center()[1])
     # c = visualize_textblocks(canvas, scattered_lines['hor'])
     # cv2.imwrite('local_tst.jpg', c)
-    final_blk_list += merge_textlines(scattered_lines['hor'], canvas=canvas, fntsize_tol=2.0)
-    final_blk_list += merge_textlines(scattered_lines['ver'])
+    # cv2.imwrite('local_tst.jpg', c)
+    final_blk_list += merge_textlines(scattered_lines['hor'], canvas=canvas, fntsize_tol=font_size_tolerance, distance_tol=distance_tolerance)
+    final_blk_list += merge_textlines(scattered_lines['ver'], fntsize_tol=font_size_tolerance, distance_tol=distance_tolerance)
     if sort_blklist:
         final_blk_list = sort_regions(final_blk_list, )
     for blk in final_blk_list:

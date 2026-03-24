@@ -160,6 +160,10 @@ class DrawingLayer(QGraphicsPixmapItem):
         if pixmap.isNull():
             self.drawed_pixmap = None
             return
+        if not self.qimg_dict:
+            painter.drawPixmap(self.offset(), pixmap)
+            self.drawed_pixmap = None
+            return
         p = QPainter()
         p.begin(pixmap)
         for key in self.qimg_dict:

@@ -62,6 +62,7 @@ class LeftBar(Widget):
     configChecked = Signal()
     open_dir = Signal(str)
     open_json_proj = Signal(str)
+    reload_proj = Signal()
     save_proj = Signal()
     save_config = Signal()
     def __init__(self, mainwindow, *args, **kwargs) -> None:
@@ -96,6 +97,10 @@ class LeftBar(Widget):
         self.save_proj = actionSaveProj.triggered
         actionSaveProj.setShortcut(QKeySequence.StandardKey.Save)
 
+        actionReloadProj = QAction(self.tr("Reload Project"), self)
+        self.reload_proj = actionReloadProj.triggered
+        actionReloadProj.setShortcut(QKeySequence.Refresh)
+
         actionExportAsDoc = QAction(self.tr("Export as Doc"), self)
         self.export_doc = actionExportAsDoc.triggered
         actionImportFromDoc = QAction(self.tr("Import from Doc"), self)
@@ -122,6 +127,7 @@ class LeftBar(Widget):
         openMenu.addSeparator()
         openMenu.addActions([
             actionSaveProj,
+            actionReloadProj,
             actionExportAsDoc,
             actionImportFromDoc,
             actionExportSrcTxt,
@@ -139,6 +145,28 @@ class LeftBar(Widget):
         openBtnToolBar.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
         openBtnToolBar.addWidget(self.openBtn)
         
+        # Export Source to TXT button
+        self.exportSrcTxtBtn = QPushButton()
+        self.exportSrcTxtBtn.setObjectName('ExportSrcTxtButton')
+        self.exportSrcTxtBtn.setText('EX')
+        font = self.exportSrcTxtBtn.font()
+        font.setPixelSize(12)
+        font.setBold(True)
+        self.exportSrcTxtBtn.setFont(font)
+        self.exportSrcTxtBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
+        self.export_src_txt_clicked = self.exportSrcTxtBtn.clicked
+        
+        # Import Translation TXT button
+        self.importTransTxtBtn = QPushButton()
+        self.importTransTxtBtn.setObjectName('ImportTransTxtButton')
+        self.importTransTxtBtn.setText('IM')
+        font = self.importTransTxtBtn.font()
+        font.setPixelSize(12)
+        font.setBold(True)
+        self.importTransTxtBtn.setFont(font)
+        self.importTransTxtBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
+        self.import_trans_txt_clicked = self.importTransTxtBtn.clicked
+        
         self.runImgtransBtn = QPushButton()
         self.runImgtransBtn.setObjectName('RunButton')
         self.runImgtransBtn.setText(self.tr('Run'))
@@ -147,10 +175,31 @@ class LeftBar(Widget):
         self.runImgtransBtn.setFont(font)
         self.runImgtransBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
         self.run_imgtrans_clicked = self.runImgtransBtn.clicked
-        self.runImgtransBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
+
+        self.saveAllBtn = QPushButton()
+        self.saveAllBtn.setObjectName('SaveAllButton')
+        self.saveAllBtn.setText(self.tr('Save'))
+        font = self.saveAllBtn.font()
+        font.setPixelSize(10)
+        self.saveAllBtn.setFont(font)
+        self.saveAllBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
+        self.save_all_clicked = self.saveAllBtn.clicked
+
+        self.reloadBtn = QPushButton()
+        self.reloadBtn.setObjectName('ReloadButton')
+        self.reloadBtn.setText(self.tr('Reload'))
+        font = self.reloadBtn.font()
+        font.setPixelSize(10)
+        self.reloadBtn.setFont(font)
+        self.reloadBtn.setFixedSize(LEFTBTN_WIDTH, LEFTBTN_WIDTH)
+        self.reload_proj_clicked = self.reloadBtn.clicked
         
         vlayout = QVBoxLayout(self)
         vlayout.addWidget(openBtnToolBar)
+        vlayout.addWidget(self.saveAllBtn)
+        vlayout.addWidget(self.reloadBtn)
+        vlayout.addWidget(self.exportSrcTxtBtn)
+        vlayout.addWidget(self.importTransTxtBtn)
         vlayout.addWidget(self.showPageListLabel)
         vlayout.addWidget(self.globalSearchChecker)
         vlayout.addWidget(self.imgTransChecker)

@@ -250,6 +250,8 @@ class FontFormatPanel(Widget):
     global_format: FontFormat = None
     restoring_textblk: bool = False
 
+    apply_font_to_all_pages = Signal()
+
     def __init__(self, app: QApplication, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.app = app
@@ -336,6 +338,8 @@ class FontFormatPanel(Widget):
         lettersp_hlayout.addWidget(self.letterSpacingBox)
         lettersp_hlayout.setSpacing(shared.WIDGET_SPACING_CLOSE)
         
+        self.bulk_action_panel = self._create_bulk_action_panel()
+
         self.global_fontfmt_str = self.tr("Global Font Format")
         self.textstyle_panel = TextStylePresetPanel(
             self.global_fontfmt_str,
@@ -373,6 +377,7 @@ class FontFormatPanel(Widget):
         FONTFORMAT_SPACING = 6
 
         vl0 = QVBoxLayout()
+        vl0.addWidget(self.bulk_action_panel)
         vl0.addWidget(self.textstyle_panel.view_widget)
         vl0.addWidget(self.textadvancedfmt_panel.view_widget)
         vl0.setSpacing(0)
@@ -420,6 +425,38 @@ class FontFormatPanel(Widget):
         self.focusOnColorDialog = False
         C.active_format = self.global_format
 
+    def _create_bulk_action_panel(self) -> QFrame:
+        panel = QFrame(self)
+        panel.setObjectName("BulkActionPanel")
+        outer_layout = QVBoxLayout(panel)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        from .custom_widget.view_panel import ExpandLabel
+        self._bulk_expand_label = ExpandLabel(self.tr("Bulk Action"), panel, size_type='normal')
+        self._bulk_expand_label.setExpand(False)
+
+        self._bulk_content = QFrame(panel)
+        self._bulk_content.setVisible(False)
+        content_layout = QVBoxLayout(self._bulk_content)
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(4)
+
+        self.applyAllPagesBtn = QPushButton(self.tr("Apply Font Style to All Pages"), self._bulk_content)
+        self.applyAllPagesBtn.setToolTip(self.tr("Select a style in Global Font Format first, then click to apply to all pages"))
+        self.applyAllPagesBtn.setEnabled(False)
+        self.applyAllPagesBtn.clicked.connect(self.apply_font_to_all_pages.emit)
+        content_layout.addWidget(self.applyAllPagesBtn)
+
+        self._bulk_expand_label.clicked.connect(self._on_bulk_expand_clicked)
+
+        outer_layout.addWidget(self._bulk_expand_label)
+        outer_layout.addWidget(self._bulk_content)
+        return panel
+
+    def _on_bulk_expand_clicked(self):
+        self._bulk_content.setVisible(self._bulk_expand_label.expanded)
+
     def global_mode(self):
         return id(C.active_format) == id(self.global_format)
     
@@ -435,6 +472,8 @@ class FontFormatPanel(Widget):
 
     def on_param_changed(self, param_name: str, value):
         func = FM.handle_ffmt_change.get(param_name)
+        if func is None:
+            return
         func_kwargs = {}
         if param_name in {'font_size', 'rel_font_size'}:
             func_kwargs['clip_size'] = True
@@ -521,9 +560,15 @@ class FontFormatPanel(Widget):
             if self.global_mode() and len(updated_keys) > 0:
                 self.set_active_format(self.global_format)
             self.set_globalfmt_title()
+            if hasattr(self, 'applyAllPagesBtn'):
+                self.applyAllPagesBtn.setEnabled(True)
+                self.applyAllPagesBtn.setToolTip(self.tr("Apply current Global Font Format style to all text blocks on all pages"))
         else:
             if self.global_mode():
                 self.set_globalfmt_title()
+            if hasattr(self, 'applyAllPagesBtn'):
+                self.applyAllPagesBtn.setEnabled(False)
+                self.applyAllPagesBtn.setToolTip(self.tr("Select a style in Global Font Format first, then click to apply to all pages"))
 
     def on_active_stylename_edited(self):
         if self.global_mode():

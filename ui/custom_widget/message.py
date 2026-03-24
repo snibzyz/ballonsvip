@@ -131,7 +131,7 @@ class ProgressMessageBox(QDialog):
         super().__init__(*args, **kwargs)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setModal(True)
+        self.setModal(False)  # Set to False to allow UI interaction during processing
 
         layout = QVBoxLayout(self)
         layout.setSpacing(0)

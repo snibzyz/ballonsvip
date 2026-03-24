@@ -456,7 +456,86 @@ class ImgtransThread(QThread):
 
             if cfg_module.enable_ocr:
                 try:
-                    self.ocr.run_ocr(img, blk_list)
+                    ocr_mode = cfg_module.ocr_mode if hasattr(cfg_module, 'ocr_mode') else 'queue'
+                    max_batch = cfg_module.ocr_max_batch if hasattr(cfg_module, 'ocr_max_batch') else 100
+                    
+                    if ocr_mode == 'batch' and len(blk_list) > 0:
+                        # Batch mode: process in batches and update results as they complete
+                        LOGGER.info(f'[OCR] Batch mode: processing {len(blk_list)} blocks (max_batch={max_batch})')
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        from threading import Lock
+                        
+                        ocr_results = {}  # {blk_idx: result_blk}
+                        ocr_lock = Lock()
+                        
+                        def ocr_worker_batch(batch_blks, batch_indices, img_copy):
+                            """Worker function to process OCR for a batch of textblocks"""
+                            try:
+                                # Set delay to 0 for immediate processing
+                                if hasattr(self.ocr, 'delay'):
+                                    original_delay = getattr(self.ocr, 'delay', 0)
+                                    self.ocr.delay = 0
+                                
+                                # Run OCR on batch
+                                result_list = self.ocr.run_ocr(img_copy, batch_blks)
+                                
+                                # NOTE: Do NOT reset angle here - angle will be reset after pipeline finished
+                                # This prevents angle from being reset when creating new text blocks
+                                
+                                # Restore delay if it was set
+                                if hasattr(self.ocr, 'delay'):
+                                    self.ocr.delay = original_delay
+                                
+                                # Update results for each block as they complete (remember which block finished first)
+                                with ocr_lock:
+                                    for idx, (blk_idx, result_blk) in enumerate(zip(batch_indices, result_list if result_list else batch_blks)):
+                                        ocr_results[blk_idx] = result_blk
+                                        # Update the actual block in the list immediately when completed
+                                        if blk_idx < len(blk_list):
+                                            blk_list[blk_idx] = result_blk
+                                        LOGGER.info(f'[OCR] Completed block {blk_idx} in batch mode')
+                                
+                                return batch_indices, result_list
+                            except Exception as e:
+                                LOGGER.error(f'[OCR] Batch failed: {e}')
+                                with ocr_lock:
+                                    for blk_idx, blk in zip(batch_indices, batch_blks):
+                                        ocr_results[blk_idx] = blk
+                                        if blk_idx < len(blk_list):
+                                            blk_list[blk_idx] = blk
+                                return batch_indices, None
+                        
+                        # Process in batches
+                        with ThreadPoolExecutor(max_workers=4) as executor:
+                            futures = []
+                            for batch_start in range(0, len(blk_list), max_batch):
+                                batch_end = min(batch_start + max_batch, len(blk_list))
+                                batch_blks = blk_list[batch_start:batch_end]
+                                batch_indices = list(range(batch_start, batch_end))
+                                
+                                # Submit batch for processing
+                                future = executor.submit(ocr_worker_batch, batch_blks, batch_indices, img.copy())
+                                futures.append(future)
+                            
+                            # Wait for all batches to complete, but results are already updated as they finish
+                            for future in as_completed(futures):
+                                try:
+                                    future.result()
+                                except Exception as e:
+                                    LOGGER.error(f'[OCR] Batch task failed: {e}')
+                            
+                            # Ensure all results are applied (should already be done, but double-check)
+                            for blk_idx in range(len(blk_list)):
+                                if blk_idx in ocr_results:
+                                    blk_list[blk_idx] = ocr_results[blk_idx]
+                            # NOTE: Do NOT reset angle here - angle will be reset after pipeline finished
+                            # This prevents angle from being reset when creating new text blocks
+                    else:
+                        # Queue mode: process sequentially (original behavior)
+                        self.ocr.run_ocr(img, blk_list)
+                        # NOTE: Do NOT reset angle here - angle will be reset after pipeline finished
+                        # This prevents angle from being reset when creating new text blocks
+                    
                 except Exception as e:
                     create_error_dialog(e, self.tr('OCR Failed.'), 'OCRFailed')
                 self.ocr_counter += 1

@@ -595,32 +595,29 @@ class DrawingPanel(Widget):
 
     def on_finish_erasing(self, stroke_item: StrokeImgItem):
         stroke_item.finishPainting()
-        # inpainted-erasing logic is essentially the same as inpainting
         if self.currentTool == self.inpaintTool:
             rect, mask, _ = stroke_item.clip(mask_only=True)
             if mask is None:
                 self.canvas.removeItem(stroke_item)
                 return
-            mask = 255 - mask
             mask_h, mask_w = mask.shape[:2]
             mask_x, mask_y = rect[0], rect[1]
             inpaint_rect = [mask_x, mask_y, mask_w + mask_x, mask_h + mask_y]
+            if self.canvas.imgtrans_proj.img_array is None or self.canvas.imgtrans_proj.inpainted_array is None or self.canvas.imgtrans_proj.mask_array is None:
+                self.canvas.removeItem(stroke_item)
+                return
             origin = self.canvas.imgtrans_proj.img_array
             origin = origin[inpaint_rect[1]: inpaint_rect[3], inpaint_rect[0]: inpaint_rect[2]]
             inpainted = self.canvas.imgtrans_proj.inpainted_array
             inpainted = inpainted[inpaint_rect[1]: inpaint_rect[3], inpaint_rect[0]: inpaint_rect[2]]
-            inpaint_mask = self.canvas.imgtrans_proj.mask_array[inpaint_rect[1]: inpaint_rect[3], inpaint_rect[0]: inpaint_rect[2]]
-            # no inpainted need to be erased
-            if inpaint_mask.sum() == 0:
-                self.canvas.removeItem(stroke_item)
-                return
-            mask = cv2.bitwise_and(mask, inpaint_mask)
-            inpaint_mask = np.zeros_like(inpainted)
-            inpaint_mask[mask > 0] = 1
-            erased_img = inpaint_mask * inpainted + (1 - inpaint_mask) * origin
-            self.canvas.push_undo_command(InpaintUndoCommand(self.canvas, erased_img, mask, inpaint_rect))
+            inpaint_mask_arr = self.canvas.imgtrans_proj.mask_array[inpaint_rect[1]: inpaint_rect[3], inpaint_rect[0]: inpaint_rect[2]]
+            brush_mask = np.zeros_like(inpainted)
+            brush_mask[mask > 0] = 1
+            restored_img = np.where(brush_mask, origin, inpainted).astype(origin.dtype)
+            new_inpaint_mask = inpaint_mask_arr.copy()
+            new_inpaint_mask[mask > 0] = 0
+            self.canvas.push_undo_command(InpaintUndoCommand(self.canvas, restored_img, new_inpaint_mask, inpaint_rect))
             self.canvas.removeItem(stroke_item)
-
         elif self.currentTool == self.penTool:
             rect, _, qimg = stroke_item.clip()
             if self.canvas.erase_img_key is not None:
@@ -629,26 +626,39 @@ class DrawingPanel(Widget):
                 self.canvas.stroke_img_item = None
             if rect is not None:
                 self.canvas.push_undo_command(StrokeItemUndoCommand(self.canvas.drawingLayer, rect, qimg, True))
-        
 
-    def runInpaint(self, inpaint_dict=None):
+    def runInpaint(self, inpaint_dict: dict = None):
+        if not self.canvas.imgtrans_proj.img_valid:
+            self.clearInpaintItems()
+            return
+
+        if self.module_manager is None:
+            logger.warning("module manager is not ready for inpaint")
+            self.clearInpaintItems()
+            return
 
         if inpaint_dict is None:
             if self.inpaint_stroke is None:
+                logger.warning("inpaint stroke not found")
+                self.clearInpaintItems()
                 return
-            elif self.inpaint_stroke.parentItem() is None:
+            if self.inpaint_stroke.parentItem() is None:
                 logger.warning("inpainting goes wrong")
                 self.clearInpaintItems()
                 return
-                
+
             rect, mask, _ = self.inpaint_stroke.clip(mask_only=True)
             if mask is None:
                 self.clearInpaintItems()
                 return
-            # we need to enlarge the mask window a bit to get better results
+
+            img = self.canvas.imgtrans_proj.inpainted_array
+            if img is None:
+                self.clearInpaintItems()
+                return
+
             mask_h, mask_w = mask.shape[:2]
             mask_x, mask_y = rect[0], rect[1]
-            img = self.canvas.imgtrans_proj.inpainted_array
             inpaint_rect = [mask_x, mask_y, mask_w + mask_x, mask_h + mask_y]
             rect_enlarged = enlarge_window(inpaint_rect, img.shape[1], img.shape[0])
             top = mask_y - rect_enlarged[1]

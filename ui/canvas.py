@@ -3,8 +3,8 @@ from typing import List, Union
 import os
 
 from qtpy.QtWidgets import QApplication, QSlider, QMenu, QGraphicsScene, QGraphicsSceneDragDropEvent , QGraphicsView, QGraphicsSceneDragDropEvent, QGraphicsRectItem, QGraphicsItem, QScrollBar, QGraphicsPixmapItem, QGraphicsSceneMouseEvent, QGraphicsSceneContextMenuEvent, QRubberBand
-from qtpy.QtCore import Qt, QDateTime, QRectF, QPointF, QPoint, Signal, QSizeF, QEvent
-from qtpy.QtGui import QKeySequence, QPixmap, QImage, QHideEvent, QKeyEvent, QWheelEvent, QResizeEvent, QPainter, QPen, QPainterPath, QCursor, QNativeGestureEvent
+from qtpy.QtCore import Qt, QDateTime, QRectF, QPointF, QPoint, Signal, QSizeF, QEvent, QTimer
+from qtpy.QtGui import QKeySequence, QPixmap, QImage, QHideEvent, QKeyEvent, QWheelEvent, QResizeEvent, QPainter, QPen, QPainterPath, QCursor, QNativeGestureEvent, QFocusEvent
 
 try:
     from qtpy.QtWidgets import QUndoStack, QUndoCommand
@@ -58,7 +58,6 @@ class MoveByKeyCommand(QUndoCommand):
     
     def id(self):
         return 1
-
 
 class CustomGV(QGraphicsView):
     ctrl_pressed = False
@@ -127,6 +126,35 @@ class CustomGV(QGraphicsView):
                 return
 
         return super().keyPressEvent(e)
+    
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        """Track when canvas gains focus"""
+        return super().focusInEvent(event)
+    
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        """Track when canvas loses focus"""
+        
+        # Auto-restore focus if it was lost to a non-interactive widget or window activation
+        reason = event.reason()
+        new_focus = QApplication.focusWidget()
+        
+        # Don't restore if user is actively editing text (SourceTextEdit, TransTextEdit)
+        from .textedit_area import SourceTextEdit, TransTextEdit
+        if isinstance(new_focus, (SourceTextEdit, TransTextEdit)):
+            return super().focusOutEvent(event)
+        
+        # Restore focus after a short delay if focus was lost due to window activation
+        # or if focus went to None (no widget has focus)
+        # Use Qt.FocusReason enum values (ActiveWindowFocusReason = 4)
+        if reason == Qt.FocusReason.ActiveWindowFocusReason or new_focus is None:
+            QTimer.singleShot(100, lambda: self.setFocus() if not self.hasFocus() else None)
+        # Also restore focus if focus was lost to a non-interactive widget (like QLabel, QWidget, etc.)
+        elif new_focus is not None:
+            # Check if the new focus widget is interactive (can receive keyboard input)
+            if not new_focus.focusPolicy() in (Qt.FocusPolicy.StrongFocus, Qt.FocusPolicy.WheelFocus, Qt.FocusPolicy.ClickFocus):
+                QTimer.singleShot(100, lambda: self.setFocus() if not self.hasFocus() else None)
+        
+        return super().focusOutEvent(event)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         self.view_resized.emit()
@@ -149,7 +177,6 @@ class CustomGV(QGraphicsView):
         if e.mimeData().hasUrls():
             # issue #908, https://stackoverflow.com/questions/4177720/accepting-drops-on-a-qgraphicsscene
             e.setAccepted(True)
-
 
 class Canvas(QGraphicsScene):
 
@@ -210,6 +237,11 @@ class Canvas(QGraphicsScene):
         self.gv.canvas = self
         self.gv.setAcceptDrops(True)
         self.gv.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.gv.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        self.gv.setOptimizationFlags(
+            QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing |
+            QGraphicsView.OptimizationFlag.DontSavePainterState
+        )
 
         self.gv.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.context_menu_requested.connect(self.on_create_contextmenu)
@@ -248,7 +280,7 @@ class Canvas(QGraphicsScene):
         self.baseLayer.setPen(pen)
 
         self.inpaintLayer = QGraphicsPixmapItem()
-        self.inpaintLayer.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.inpaintLayer.setTransformationMode(Qt.TransformationMode.FastTransformation)
         self.drawingLayer = DrawingLayer()
         self.drawingLayer.setTransformationMode(Qt.TransformationMode.FastTransformation)
         self.textLayer = QGraphicsPixmapItem()
@@ -342,7 +374,7 @@ class Canvas(QGraphicsScene):
         self.baseLayer.setScale(scale)
         self.setSceneRect(0, 0, self.baseLayer.sceneBoundingRect().width(), self.baseLayer.sceneBoundingRect().height())
 
-    def render_result_img(self):
+    def render_result_img(self, preserve_selection=False):
 
         self.inpaintLayer.hide()
         tlayer_opacity_before = self.textLayer.opacity()
@@ -357,6 +389,12 @@ class Canvas(QGraphicsScene):
             vb_pos = self.vscroll_bar.value()
             self._set_scene_scale(1)
 
+        # Save selection state if we need to preserve it (e.g., during autosave)
+        selected_item_ids = []
+        if preserve_selection:
+            selected_items = self.selected_text_items()
+            selected_item_ids = [item.idx for item in selected_items]
+
         self.clearSelection()
         if self.textEditMode() and self.txtblkShapeControl.blk_item is not None:
             blk_item = self.txtblkShapeControl.blk_item
@@ -364,6 +402,16 @@ class Canvas(QGraphicsScene):
                 blk_item.endEdit(keep_focus=False)
             if blk_item.isSelected():
                 blk_item.setSelected(False)
+
+        # Save and temporarily disable draw_rect for all text blocks to avoid saving borders
+        # This ensures the saved result image only contains the rendered text, not the text block frames
+        from .textitem import TextBlkItem
+        text_items = [item for item in self.items() if isinstance(item, TextBlkItem)]
+        draw_rect_states = {}
+        for item in text_items:
+            draw_rect_states[item.idx] = item.draw_rect
+            item.draw_rect = False  # Disable borders for rendering
+            item.update()  # Force update to apply the change
 
         result = ndarray2pixmap(self.imgtrans_proj.inpainted_array, return_qimg=True)
         canvas_sz = self.img_window_size()
@@ -373,6 +421,12 @@ class Canvas(QGraphicsScene):
         rect = QRectF(0, 0, canvas_sz.width(), canvas_sz.height())
         self.render(painter, rect, rect)   #  produce blurred result if target/source rect not specified #320
         painter.end()
+        
+        # Restore draw_rect state for all text blocks
+        for item in text_items:
+            if item.idx in draw_rect_states:
+                item.draw_rect = draw_rect_states[item.idx]
+                item.update()  # Force update to restore the state
         
         if tlayer_opacity_before != 1:
             self.textLayer.setOpacity(tlayer_opacity_before)
@@ -386,6 +440,15 @@ class Canvas(QGraphicsScene):
                 self.vscroll_bar.setValue(vb_pos)
         self.inpaintLayer.show()
 
+        # Restore selection if it was preserved (e.g., during autosave)
+        if preserve_selection and len(selected_item_ids) > 0:
+            self.block_selection_signal = True
+            # Find all TextBlkItem instances in the scene and restore selection
+            for item in text_items:
+                if item.idx in selected_item_ids:
+                    item.setSelected(True)
+            self.block_selection_signal = False
+
         return result
     
     def updateLayers(self):
@@ -398,18 +461,25 @@ class Canvas(QGraphicsScene):
         if inpainted_as_base:
             self.base_pixmap = ndarray2pixmap(self.imgtrans_proj.inpainted_array)
 
+        need_original_overlay = self.imgtrans_proj.img_valid and pcfg.original_transparency > 0
+        need_mask_overlay = self.imgtrans_proj.mask_valid and pcfg.mask_transparency > 0 and not self.textEditMode()
+
+        if not need_original_overlay and not need_mask_overlay:
+            self.inpaintLayer.setPixmap(self.base_pixmap)
+            return
+
         pixmap = self.base_pixmap.copy()
         painter = QPainter(pixmap)
         origin = QPoint(0, 0)
 
-        if self.imgtrans_proj.img_valid and pcfg.original_transparency > 0:
+        if need_original_overlay:
             painter.setOpacity(pcfg.original_transparency)
             if inpainted_as_base:
                 painter.drawPixmap(origin, ndarray2pixmap(self.imgtrans_proj.img_array))
             else:
                 painter.drawPixmap(origin, pixmap)
 
-        if self.imgtrans_proj.mask_valid and pcfg.mask_transparency > 0 and not self.textEditMode():
+        if need_mask_overlay:
             painter.setOpacity(pcfg.mask_transparency)
             painter.drawPixmap(origin, ndarray2pixmap(self.imgtrans_proj.mask_array))
 
@@ -472,8 +542,13 @@ class Canvas(QGraphicsScene):
             blk_item = self.txtblkShapeControl.blk_item
             if blk_item is not None and blk_item.isEditing():
                 blk_item.endEdit()
-        if self.hasFocus() and not self.block_selection_signal:
-            self.incanvas_selection_changed.emit()
+        # Always process selection changes in text edit mode, even if canvas temporarily lost focus
+        # This ensures text block selection is properly handled when clicking on text blocks
+        if not self.block_selection_signal:
+            # In text edit mode, always process selection changes
+            # In other modes, only process if canvas has focus
+            if self.textEditMode() or self.hasFocus():
+                self.incanvas_selection_changed.emit()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
@@ -633,6 +708,14 @@ class Canvas(QGraphicsScene):
             self.pan_initial_pos = event.screenPos()
             return
         
+        # Ensure canvas has focus when clicking on it (but not on text blocks)
+        # Text blocks will handle their own focus in onLeftbuttonPressed
+        item_at_pos = self.itemAt(event.scenePos(), self.gv.viewportTransform())
+        if item_at_pos is None or not isinstance(item_at_pos, TextBlkItem):
+            # Clicking on empty canvas or non-text-block item - ensure canvas has focus
+            if not self.gv.hasFocus():
+                self.gv.setFocus()
+        
         if self.imgtrans_proj.img_valid:
             if self.textblock_mode and len(self.selectedItems()) == 0 and self.textEditMode():
                 if btn == Qt.MouseButton.RightButton:
@@ -714,7 +797,6 @@ class Canvas(QGraphicsScene):
 
         self.setDrawingLayer()
 
-
     def setDrawingLayer(self, img: Union[QPixmap, np.ndarray] = None):
         
         self.drawingLayer.clearAllDrawings()
@@ -780,6 +862,7 @@ class Canvas(QGraphicsScene):
             menu.addSeparator()
             translate_act = menu.addAction(self.tr("translate"))
             ocr_act = menu.addAction(self.tr("OCR"))
+            ocr_act.setShortcut(QKeySequence("Ctrl+E"))
             ocr_translate_act = menu.addAction(self.tr("OCR and translate"))
             ocr_translate_inpaint_act = menu.addAction(self.tr("OCR, translate and inpaint"))
             inpaint_act = menu.addAction(self.tr("inpaint"))

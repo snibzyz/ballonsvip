@@ -5,7 +5,8 @@ PyQt6>=6.6.1 ; python_version > "3.8"
 PyQt5-Qt5>=5.15.2 ; python_version <= "3.8"
 PyQt5>=5.15.10 ; python_version <= "3.8"
 numpy<2
-urllib3
+setuptools
+urllib3<2.0
 jaconv
 torch
 torchvision

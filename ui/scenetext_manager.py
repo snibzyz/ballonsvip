@@ -22,7 +22,7 @@ from utils import shared
 from utils.imgproc_utils import extract_ballon_region, rotate_polygons, get_block_mask
 from utils.text_processing import seg_text, is_cjk
 from utils.text_layout import layout_text
-
+from .misc import apply_fontformat_to_html
 
 class CreateItemCommand(QUndoCommand):
     def __init__(self, blk_item: TextBlkItem, ctrl, parent=None):
@@ -44,11 +44,9 @@ class CreateItemCommand(QUndoCommand):
     def undo(self):
         self.ctrl.deleteTextblkItemList([self.blk_item], [self.pairw])
 
-
 class EmptyCommand(QUndoCommand):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
-
 
 class DeleteBlkItemsCommand(QUndoCommand):
     def __init__(self, blk_list: List[TextBlkItem], mode: int, ctrl, parent=None):
@@ -199,7 +197,6 @@ class DeleteBlkItemsCommand(QUndoCommand):
             self.sw.highlighter_list += self.highlighter_list
             self.sw.updateCounterText()
 
-
 class PasteBlkItemsCommand(QUndoCommand):
     def __init__(self, blk_list: List[TextBlkItem], pwidget_list: List[TransPairWidget], ctrl, parent=None):
         super().__init__(parent)
@@ -225,7 +222,6 @@ class PasteBlkItemsCommand(QUndoCommand):
     def undo(self):
         self.ctrl.deleteTextblkItemList(self.blk_list, self.pwidget_list)
 
-
 class PasteSrcItemsCommand(QUndoCommand):
     def __init__(self, src_list: List[SourceTextEdit], paste_list: List[str]):
         super().__init__()
@@ -240,7 +236,6 @@ class PasteSrcItemsCommand(QUndoCommand):
     def undo(self):
         for src, text in zip(self.src_list, self.ori_text_list):
             src.setPlainText(text)
-
 
 class RearrangeBlksCommand(QUndoCommand):
 
@@ -298,7 +293,6 @@ class RearrangeBlksCommand(QUndoCommand):
             pw_ct.show()
             self.ctrl.textEditList.ensureWidgetVisible(pw_ct, yMargin=pw.height())
 
-
 class TextPanel(Widget):
     def __init__(self, app: QApplication, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -310,7 +304,6 @@ class TextPanel(Widget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(7)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
 
 class SceneTextManager(QObject):
     new_textblk = Signal(int)
@@ -346,6 +339,7 @@ class SceneTextManager(QObject):
         self.textEditList.rearrange_blks.connect(self.on_rearrange_blks)
         self.formatpanel = textpanel.formatpanel
         self.formatpanel.textstyle_panel.apply_fontfmt.connect(self.onFormatTextblks)
+        self.formatpanel.apply_font_to_all_pages.connect(self.onApplyFontToAllPages)
 
         self.imgtrans_proj = self.canvas.imgtrans_proj
         self.textblk_item_list: List[TextBlkItem] = []
@@ -439,6 +433,10 @@ class SceneTextManager(QObject):
         self.pairwidget_list.clear()
 
     def updateSceneTextitems(self):
+        # Save current selection before clearing
+        selected_item_ids = []
+        if self.txtblkShapeControl.blk_item is not None:
+            selected_item_ids = [self.txtblkShapeControl.blk_item.idx]
         self.hovering_transwidget = None
         self.txtblkShapeControl.setBlkItem(None)
         self.clearSceneTextitems()
@@ -448,17 +446,46 @@ class SceneTextManager(QObject):
             blk_item = self.addTextBlock(textblock)
         if self.auto_textlayout_flag:
             self.updateTextBlkList()
+        
+        # Ensure text block display mode is properly restored after updating scene items
+        # This prevents the blue text block rectangles from being hidden unexpectedly after page changes or updates
+        # Use pcfg.imgtrans_textblock as the source of truth for the display state
+        # This ensures that even if textblock_mode was False during update, the display state is restored
+        display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
+        self.showTextblkItemRect(display_mode)
+        
+        # Restore selection if it was saved before clearing
+        # This prevents selection from disappearing when clicking during OCR or when updateSceneTextitems is called
+        if len(selected_item_ids) > 0 and len(self.textblk_item_list) > 0:
+            # Find the text block item with the saved ID and restore selection
+            restored = False
+            restored_id = None
+            for blk_item in self.textblk_item_list:
+                if blk_item.idx in selected_item_ids:
+                    self.canvas.block_selection_signal = True
+                    blk_item.setSelected(True)
+                    self.txtblkShapeControl.setBlkItem(blk_item)
+                    self.canvas.block_selection_signal = False
+                    restored = True
+                    restored_id = blk_item.idx
+                    break
 
     def addTextBlock(self, blk: Union[TextBlock, TextBlkItem] = None) -> TextBlkItem:
         if isinstance(blk, TextBlkItem):
             blk_item = blk
             blk_item.idx = len(self.textblk_item_list)
         else:
+            
             translation = ''
             if self.auto_textlayout_flag and not blk.vertical:
                 translation = blk.translation
                 blk.translation = ''
-            blk_item = TextBlkItem(blk, len(self.textblk_item_list), show_rect=self.canvas.textblock_mode)
+            # Use pcfg.imgtrans_textblock as the source of truth for display state
+            # This ensures text blocks respect the user's display preference
+            display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
+            blk_item = TextBlkItem(blk, len(self.textblk_item_list), show_rect=display_mode)
+            
+            
             if translation:
                 blk.translation = translation
                 rst = self.layout_textblk(blk_item, text=translation)
@@ -587,6 +614,10 @@ class SceneTextManager(QObject):
             for item in selections:
                 item.oldPos = item.pos()
         self.changeHoveringWidget(self.pairwidget_list[blk_id].e_trans)
+        # Ensure canvas maintains focus when clicking on text blocks
+        # This prevents selection from being lost due to focus issues
+        if not self.canvas.gv.hasFocus():
+            self.canvas.gv.setFocus()
 
     def onTextBlkItemEndEdit(self, blk_id: int):
         self.canvas.editing_textblkitem = None
@@ -661,7 +692,6 @@ class SceneTextManager(QObject):
         textlist = '\n'.join(textlist)
         self.app_clipborad.setText(textlist, QClipboard.Mode.Clipboard)
 
-
     def onPasteBlkItems(self, pos: QPointF):
         if pos is None:
             pos_x, pos_y = 0, 0
@@ -703,10 +733,15 @@ class SceneTextManager(QObject):
 
             self.canvas.push_undo_command(AutoLayoutCommand(selected_blks, old_rect_lst, old_html_lst, trans_widget_lst))
 
-    def onResetAngle(self):
-        selected_blks = self.canvas.selected_text_items()
+    def onResetAngle(self, reset_all: bool = False, items: List[TextBlkItem] = None):
+        # If items list is provided, use it directly; otherwise use selected items
+        if items is not None:
+            selected_blks = items
+        else:
+            selected_blks = self.canvas.selected_text_items()
         if len(selected_blks) > 0:
-            self.canvas.push_undo_command(ResetAngleCommand(selected_blks, self.txtblkShapeControl))
+            cmd = ResetAngleCommand(selected_blks, self.txtblkShapeControl, reset_all=reset_all)
+            self.canvas.push_undo_command(cmd)
 
     def onSqueezeBlk(self):
         selected_blks = self.canvas.selected_text_items()
@@ -716,7 +751,8 @@ class SceneTextManager(QObject):
     def on_incanvas_selection_changed(self):
         if self.canvas.textEditMode():
             textitems = self.canvas.selected_text_items()
-            self.textEditList.set_selected_list([t.idx for t in textitems])
+            selected_ids = [t.idx for t in textitems]
+            self.textEditList.set_selected_list(selected_ids)
             if len(textitems) == 1:
                 self.formatpanel.set_textblk_item(textitems[-1])
             else:
@@ -927,6 +963,7 @@ class SceneTextManager(QObject):
         blkitem.repaint_background()
 
     def onEndCreateTextBlock(self, rect: QRectF):
+        
         xyxy = np.array([rect.x(), rect.y(), rect.right(), rect.bottom()])        
         xyxy = np.round(xyxy).astype(np.int32)
         block = TextBlock(xyxy)
@@ -935,7 +972,14 @@ class SceneTextManager(QObject):
         block.set_lines_by_xywh(xywh)
         block.src_is_vertical = self.formatpanel.global_format.vertical
         blk_item = TextBlkItem(block, len(self.textblk_item_list), set_format=False, show_rect=True)
-        blk_item.set_fontformat(self.formatpanel.global_format)
+        default_fontformat = self.formatpanel.global_format.deepcopy()
+        if pcfg.fixed_font_enabled:
+            default_fontformat.font_family = pcfg.fixed_font_family
+            default_fontformat.font_size = pcfg.fixed_font_size
+        blk_item.set_fontformat(default_fontformat)
+        block.fontformat.merge(default_fontformat)
+        
+        
         self.canvas.push_undo_command(CreateItemCommand(blk_item, self))
 
     def on_paste2selected_textitems(self):
@@ -1122,6 +1166,19 @@ class SceneTextManager(QObject):
         self.canvas.gv.ensureVisible(self.textblk_item_list[edit.idx])
         self.txtblkShapeControl.setBlkItem(self.textblk_item_list[edit.idx])
 
+    def onApplyFontToAllPages(self):
+        fmt = self.formatpanel.global_format.deepcopy()
+        if self.imgtrans_proj.current_img is not None:
+            self.updateTextBlkList()
+        for pagename, blklist in self.imgtrans_proj.pages.items():
+            for blk in blklist:
+                blk.fontformat.merge(fmt)
+                if blk.rich_text:
+                    blk.rich_text = apply_fontformat_to_html(blk.rich_text, blk.fontformat)
+        for blk_item in self.textblk_item_list:
+            blk_item.set_fontformat(blk_item.blk.fontformat, set_char_format=True)
+        self.mainwindow.applyFontToAllPagesAndSave()
+
     def on_page_replace_one(self):
         self.canvas.push_undo_command(PageReplaceOneCommand(self.canvas.search_widget))
 
@@ -1135,4 +1192,3 @@ def get_text_size(fm: QFontMetricsF, text: str) -> Tuple[int, int]:
     
 def get_words_length_list(fm: QFontMetricsF, words: List[str]) -> List[int]:
     return [int(np.ceil(fm.horizontalAdvance(word))) for word in words]
-
