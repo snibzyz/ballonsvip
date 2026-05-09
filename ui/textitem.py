@@ -215,10 +215,10 @@ class TextBlkItem(QGraphicsTextItem):
             blk.lines = xywh2xyxypoly(xywh).reshape(-1, 4, 2).tolist()
         self.setVertical(blk.vertical)
         self.setRect(blk.bounding_rect())
-        
+
         if blk.angle != 0:
             self.setRotation(blk.angle)
-        
+
         set_char_fmt = False
         if blk.translation:
             set_char_fmt = True
@@ -245,6 +245,70 @@ class TextBlkItem(QGraphicsTextItem):
         self.setShadow(font_fmt, repaint=False)
         self.setStrokeWidth(font_fmt.stroke_width, repaint_background=False)
         self.repaint_background()
+
+    def reset_with_blk(self, blk: TextBlock, idx: int, show_rect: bool = False):
+        # Reuse this item for a new TextBlock without rebuilding it.
+        # Signal connections set in SceneTextManager.addTextBlkItem must remain intact,
+        # so we only reset mutable state here -- never disconnect/reconnect signals.
+
+        # End any active text edit before recycling so editing flags and cache mode
+        # match the post-__init__ state.
+        if self.is_editting():
+            self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+            self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+
+        # Reset transient editing/IME flags so stale state from the previous page
+        # cannot leak into the new content (e.g. focused undo propagation).
+        self.pre_editing = False
+        self.repainting = False
+        self.reshaping = False
+        self.under_ctrl = False
+        self.is_formatting = False
+        self.in_redo_undo = False
+        self.change_from = 0
+        self.change_added = 0
+        self.input_method_from = -1
+        self.input_method_text = ''
+        self.block_all_input = False
+        self.block_change_signal = False
+        self.old_ffmt_values = None
+        self.background_pixmap = None
+        self.oldPos = QPointF()
+        self.oldRect = QRectF()
+        self.repaint_on_changed = True
+        self.draw_rect = show_rect
+        self.idx = idx
+
+        # Reset rotation/scale to neutral so the new blk's geometry isn't compounded
+        # with the previous block's transform.
+        self.setScale(1.0)
+        self.setRotation(0)
+
+        # Wipe document content/undo history before re-applying formatting.
+        # blockSignals avoids spurious propagate_user_edited / push_undo_stack emissions
+        # while we tear down the old document.
+        self.block_change_signal = True
+        doc = self.document()
+        doc.blockSignals(True)
+        doc.clear()
+        doc.clearUndoRedoStacks()
+        self.old_undo_steps = doc.availableUndoSteps()
+        doc.blockSignals(False)
+        self.block_change_signal = False
+
+        # Re-init from the new TextBlock. set_format=True replays the same path used
+        # by __init__ so visual state matches a freshly constructed item.
+        self.initTextBlock(blk, set_format=True)
+
+        # initTextBlock updates self.fontformat to blk.fontformat, but a same-vertical
+        # setVertical path returns early so the layout still holds the previous
+        # fontformat reference. Re-sync it for any future readers.
+        if self.layout is not None and self.fontformat is not None:
+            self.layout.fontformat = self.fontformat
+
+        # Snapshot undo step counter after init so subsequent edits can be detected.
+        self.old_undo_steps = self.document().availableUndoSteps()
+        self.update()
 
     def setCenterTransform(self):
         center = self.boundingRect().center()
@@ -1094,6 +1158,11 @@ class TextBlkItem(QGraphicsTextItem):
         old_h = self._display_rect.height()
 
         oc = self.sceneBoundingRect().center()
+        # Notify the scene's BSP index that boundingRect() is about to change.
+        # Without this the scene caches the old bounds and selection/box overlays
+        # (which paint against boundingRect) draw at the previous size, leaving
+        # stale frames behind when text auto-grows / squeezes.
+        self.prepareGeometryChange()
         self._display_rect.setWidth(w)
         self._display_rect.setHeight(h)
         self.setCenterTransform()

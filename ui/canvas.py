@@ -1,3 +1,4 @@
+import gc
 import numpy as np
 from typing import List, Union
 import os
@@ -384,16 +385,27 @@ class Canvas(QGraphicsScene):
         if not tlayer_visible:
             self.textLayer.show()
         scale_before = self.scale_factor
+        hb_pos = vb_pos = 0
         if scale_before != 1:
             hb_pos = self.hscroll_bar.value()
             vb_pos = self.vscroll_bar.value()
             self._set_scene_scale(1)
 
-        # Save selection state if we need to preserve it (e.g., during autosave)
+        # Save selection + shape-control state up front. clearSelection() below also
+        # tears down active editing via on_selection_changed, so we capture the
+        # shape-control target BEFORE that happens. Without this the autosave path
+        # (preserve_selection=True) would re-select the items but never re-bind
+        # txtblkShapeControl, leaving the selection box invisible until the user
+        # clicks again.
+        from .textitem import TextBlkItem
         selected_item_ids = []
+        prev_shape_target_idx = None
         if preserve_selection:
             selected_items = self.selected_text_items()
             selected_item_ids = [item.idx for item in selected_items]
+            sc_blk = self.txtblkShapeControl.blk_item
+            if sc_blk is not None and isinstance(sc_blk, TextBlkItem) and sc_blk.scene() is self:
+                prev_shape_target_idx = sc_blk.idx
 
         self.clearSelection()
         if self.textEditMode() and self.txtblkShapeControl.blk_item is not None:
@@ -404,50 +416,77 @@ class Canvas(QGraphicsScene):
                 blk_item.setSelected(False)
 
         # Save and temporarily disable draw_rect for all text blocks to avoid saving borders
-        # This ensures the saved result image only contains the rendered text, not the text block frames
-        from .textitem import TextBlkItem
+        # in the rendered output. Snapshot via the live (id, item) pair -- using item.idx
+        # as a dict key is unsafe because pooled-then-recovered items can collide on idx
+        # during transient states (e.g. mid-undo). Wrap the render+restore in try/finally so
+        # an exception in self.render() can never leave draw_rect=False permanently, which
+        # would silently hide all bounding boxes.
         text_items = [item for item in self.items() if isinstance(item, TextBlkItem)]
-        draw_rect_states = {}
-        for item in text_items:
-            draw_rect_states[item.idx] = item.draw_rect
-            item.draw_rect = False  # Disable borders for rendering
-            item.update()  # Force update to apply the change
+        prev_draw_rect = [(item, item.draw_rect) for item in text_items]
+        for item, _ in prev_draw_rect:
+            item.draw_rect = False
+            item.update()
 
         result = ndarray2pixmap(self.imgtrans_proj.inpainted_array, return_qimg=True)
         canvas_sz = self.img_window_size()
         painter = QPainter(result)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         rect = QRectF(0, 0, canvas_sz.width(), canvas_sz.height())
-        self.render(painter, rect, rect)   #  produce blurred result if target/source rect not specified #320
-        painter.end()
-        
-        # Restore draw_rect state for all text blocks
-        for item in text_items:
-            if item.idx in draw_rect_states:
-                item.draw_rect = draw_rect_states[item.idx]
-                item.update()  # Force update to restore the state
-        
-        if tlayer_opacity_before != 1:
-            self.textLayer.setOpacity(tlayer_opacity_before)
-        if not tlayer_visible:
-            self.textLayer.hide()
-        if scale_before != 1:
-            self._set_scene_scale(scale_before)
-            if self.hscroll_bar.value() != hb_pos:
-                self.hscroll_bar.setValue(hb_pos)
-            if self.vscroll_bar.value() != vb_pos:
-                self.vscroll_bar.setValue(vb_pos)
-        self.inpaintLayer.show()
+        try:
+            self.render(painter, rect, rect)   #  produce blurred result if target/source rect not specified #320
+        finally:
+            painter.end()
+            # Restore draw_rect state regardless of render() outcome.
+            for item, prev in prev_draw_rect:
+                item.draw_rect = prev
+                item.update()
 
-        # Restore selection if it was preserved (e.g., during autosave)
-        if preserve_selection and len(selected_item_ids) > 0:
-            self.block_selection_signal = True
-            # Find all TextBlkItem instances in the scene and restore selection
-            for item in text_items:
-                if item.idx in selected_item_ids:
-                    item.setSelected(True)
-            self.block_selection_signal = False
+            if tlayer_opacity_before != 1:
+                self.textLayer.setOpacity(tlayer_opacity_before)
+            if not tlayer_visible:
+                self.textLayer.hide()
+            if scale_before != 1:
+                self._set_scene_scale(scale_before)
+                if self.hscroll_bar.value() != hb_pos:
+                    self.hscroll_bar.setValue(hb_pos)
+                if self.vscroll_bar.value() != vb_pos:
+                    self.vscroll_bar.setValue(vb_pos)
+            self.inpaintLayer.show()
+
+            # Restore selection + shape control if preserved (autosave path).
+            # block_selection_signal silences the per-item selectionChanged storm so
+            # on_incanvas_selection_changed only fires once after the bulk restore.
+            if preserve_selection and len(selected_item_ids) > 0:
+                prev_block_sel = self.block_selection_signal
+                self.block_selection_signal = True
+                emit_after = False
+                try:
+                    restored_items = []
+                    for item in text_items:
+                        if item.scene() is self and item.idx in selected_item_ids:
+                            item.setSelected(True)
+                            restored_items.append(item)
+                    # Re-bind txtblkShapeControl so the dashed selection frame reappears
+                    # after the autosave-driven render cycle. Pick the previous target
+                    # if it's still around, else fall back to the first restored item.
+                    target = None
+                    if prev_shape_target_idx is not None:
+                        for item in restored_items:
+                            if item.idx == prev_shape_target_idx:
+                                target = item
+                                break
+                    if target is None and restored_items:
+                        target = restored_items[0]
+                    if target is not None:
+                        self.txtblkShapeControl.setBlkItem(target)
+                    emit_after = bool(restored_items)
+                finally:
+                    self.block_selection_signal = prev_block_sel
+                # Notify panels once selection state is fully consistent.
+                # Only emit if we weren't already inside a higher-level batch
+                # (e.g. a caller already holds block_selection_signal True).
+                if emit_after and not self.block_selection_signal:
+                    self.incanvas_selection_changed.emit()
 
         return result
     
@@ -459,6 +498,9 @@ class Canvas(QGraphicsScene):
         inpainted_as_base = self.imgtrans_proj.inpainted_valid
         
         if inpainted_as_base:
+            # release previous pixmap GPU memory before allocating a new one
+            if self.base_pixmap is not None:
+                self.base_pixmap = None
             self.base_pixmap = ndarray2pixmap(self.imgtrans_proj.inpainted_array)
 
         need_original_overlay = self.imgtrans_proj.img_valid and pcfg.original_transparency > 0
@@ -783,6 +825,8 @@ class Canvas(QGraphicsScene):
         self.clearSelection()
         self.setProjSaveState(False)
         self.updateLayers()
+        # force release of dropped pixmaps from previous page (GPU memory)
+        gc.collect()
 
         if self.base_pixmap is not None:
             pixmap = self.base_pixmap.copy()
@@ -948,13 +992,20 @@ class Canvas(QGraphicsScene):
             self.proj_savestate_changed.emit(un_saved)
 
     def removeItem(self, item: QGraphicsItem) -> None:
+        # Save/restore block_selection_signal instead of clobbering to False:
+        # callers like SceneTextManager.clearSceneTextitems rely on block_selection_signal
+        # remaining True across many removeItem calls so the scene doesn't fire
+        # incanvas_selection_changed against a half-cleared textblk_item_list.
+        prev_block_sel = self.block_selection_signal
         self.block_selection_signal = True
-        super().removeItem(item)
-        if isinstance(item, StrokeImgItem):
-            item.setParentItem(None)
-            self.stroke_img_item = None
-            self.erase_img_key = None
-        self.block_selection_signal = False
+        try:
+            super().removeItem(item)
+            if isinstance(item, StrokeImgItem):
+                item.setParentItem(None)
+                self.stroke_img_item = None
+                self.erase_img_key = None
+        finally:
+            self.block_selection_signal = prev_block_sel
 
     def get_active_undostack(self) -> QUndoStack:
         if self.textEditMode():

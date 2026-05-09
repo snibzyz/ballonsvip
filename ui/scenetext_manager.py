@@ -2,6 +2,7 @@
 from typing import List, Union, Tuple
 import numpy as np
 import copy
+import time
 
 from qtpy.QtWidgets import QApplication, QWidget, QGraphicsItem
 from qtpy.QtCore import QObject, QRectF, Qt, Signal, QPointF, QPoint
@@ -350,6 +351,15 @@ class SceneTextManager(QObject):
 
         self.prev_blkitem: TextBlkItem = None
 
+        # Object pool for fast page switching: TextBlkItem and TransPairWidget are
+        # expensive to construct (signal wiring + font/document setup), so pool the
+        # excess instead of destroying and rebuilding every page change.
+        # Capped to avoid retaining huge buffers on multi-page projects with one
+        # outlier page that has hundreds of blocks.
+        self._blk_pool: List[TextBlkItem] = []
+        self._pw_pool: List[TransPairWidget] = []
+        self._pool_max_size: int = 100
+
     def on_switch_textitem(self, switch_delta: int, key_event: QKeyEvent = None, current_editing_widget: Union[SourceTextEdit, TransTextEdit] = None):
         n_blk = len(self.textblk_item_list)
         if n_blk < 1:
@@ -421,82 +431,264 @@ class SceneTextManager(QObject):
     def adjustSceneTextRect(self):
         self.txtblkShapeControl.updateBoundingRect()
 
+    def _pool_release_blk_item(self, blkitem: TextBlkItem):
+        # Hide and detach the item from the scene without destroying it. Signal
+        # connections established in addTextBlkItem stay live so reuse is safe.
+        # Avoid firing end_edit / selectionChanged during teardown -- those slots
+        # rely on textblk_item_list[blk_id] which is in flux during the swap.
+        #
+        # NOTE: blkitem.blockSignals only suppresses signals emitted by the item
+        # itself. QGraphicsScene.selectionChanged fires from the scene when
+        # setSelected(False) is called below, so we also raise
+        # canvas.block_selection_signal to keep on_selection_changed from
+        # cascading into on_incanvas_selection_changed during the swap (which
+        # would touch a half-cleared textblk_item_list).
+        if self.canvas.editing_textblkitem is blkitem:
+            self.canvas.editing_textblkitem = None
+        was_blocked = blkitem.signalsBlocked()
+        prev_block_sel = self.canvas.block_selection_signal
+        blkitem.blockSignals(True)
+        self.canvas.block_selection_signal = True
+        try:
+            if blkitem.isSelected():
+                blkitem.setSelected(False)
+            if blkitem.is_editting():
+                blkitem.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+                blkitem.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+            # under_ctrl is set when txtblkShapeControl points at this item.
+            # Clear it before pooling so a recycled item never starts life with
+            # a stale "I'm under shape control" flag (would mis-route
+            # squeezeBoundingRect, set_size etc.).
+            blkitem.under_ctrl = False
+            blkitem.setVisible(False)
+            # Detaching from the scene avoids paint/hit-test cost while pooled.
+            if blkitem.scene() is not None:
+                self.canvas.removeItem(blkitem)
+        finally:
+            blkitem.blockSignals(was_blocked)
+            self.canvas.block_selection_signal = prev_block_sel
+        if len(self._blk_pool) < self._pool_max_size:
+            self._blk_pool.append(blkitem)
+        # else: item drops out of all references and is GC'd, capping memory.
+
+    def _pool_release_pair_widget(self, pw: TransPairWidget):
+        # textEditList.removeWidget hides + removes from layout but keeps the
+        # widget alive (parented to the layout's owner) so we can re-insert it.
+        self.textEditList.removeWidget(pw)
+        if len(self._pw_pool) < self._pool_max_size:
+            self._pw_pool.append(pw)
+
+    def _pool_acquire_blk_item(self) -> TextBlkItem:
+        if self._blk_pool:
+            return self._blk_pool.pop()
+        return None
+
+    def _pool_acquire_pair_widget(self) -> TransPairWidget:
+        if self._pw_pool:
+            return self._pw_pool.pop()
+        return None
+
     def clearSceneTextitems(self):
         self.hovering_transwidget = None
         self.txtblkShapeControl.setBlkItem(None)
+        # Pool live items rather than destroying them so updateSceneTextitems can
+        # reuse them on the next page. removeItem detaches from the scene; the
+        # TextBlkItem instance itself stays alive in the pool with signals intact.
         for blkitem in self.textblk_item_list:
-            self.canvas.removeItem(blkitem)
+            self._pool_release_blk_item(blkitem)
         self.textblk_item_list.clear()
         self.textEditList.clearAllSelected()
         for textwidget in self.pairwidget_list:
-            self.textEditList.removeWidget(textwidget)
+            self._pool_release_pair_widget(textwidget)
         self.pairwidget_list.clear()
 
     def updateSceneTextitems(self):
-        # Save current selection before clearing
-        selected_item_ids = []
+        # Save current selection (all selected items, not just shape-control target)
+        # so multi-select survives the page rebuild.
+        selected_item_ids = [item.idx for item in self.canvas.selected_text_items(sort=False)]
+        prev_shape_target_idx = None
         if self.txtblkShapeControl.blk_item is not None:
-            selected_item_ids = [self.txtblkShapeControl.blk_item.idx]
+            prev_shape_target_idx = self.txtblkShapeControl.blk_item.idx
+            if prev_shape_target_idx not in selected_item_ids:
+                # Shape control can target an item that's hovered but not selected.
+                # Track it separately so we can re-bind after the rebuild.
+                pass
         self.hovering_transwidget = None
+
+        # Hold off scene selectionChanged side effects across the whole rebuild
+        # (including the txtblkShapeControl.setBlkItem(None) below, which can
+        # trigger endEdit -> setSelected(True) on the outgoing item).
+        # Each pooled-out item triggers selectionChanged from the scene, which
+        # cascades into on_incanvas_selection_changed -> formatpanel.set_textblk_item.
+        # Doing that against a half-cleared textblk_item_list is what causes
+        # the formatpanel + selection box to flicker during a page switch.
+        prev_block_sel = self.canvas.block_selection_signal
+        self.canvas.block_selection_signal = True
+
         self.txtblkShapeControl.setBlkItem(None)
-        self.clearSceneTextitems()
-        for textblock in self.imgtrans_proj.current_block_list():
-            if textblock.font_family is None or textblock.font_family.strip() == '':
-                textblock.font_family = self.formatpanel.familybox.currentText()
-            blk_item = self.addTextBlock(textblock)
-        if self.auto_textlayout_flag:
-            self.updateTextBlkList()
-        
-        # Ensure text block display mode is properly restored after updating scene items
-        # This prevents the blue text block rectangles from being hidden unexpectedly after page changes or updates
-        # Use pcfg.imgtrans_textblock as the source of truth for the display state
-        # This ensures that even if textblock_mode was False during update, the display state is restored
-        display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
-        self.showTextblkItemRect(display_mode)
-        
-        # Restore selection if it was saved before clearing
-        # This prevents selection from disappearing when clicking during OCR or when updateSceneTextitems is called
-        if len(selected_item_ids) > 0 and len(self.textblk_item_list) > 0:
-            # Find the text block item with the saved ID and restore selection
-            restored = False
-            restored_id = None
-            for blk_item in self.textblk_item_list:
-                if blk_item.idx in selected_item_ids:
-                    self.canvas.block_selection_signal = True
-                    blk_item.setSelected(True)
-                    self.txtblkShapeControl.setBlkItem(blk_item)
-                    self.canvas.block_selection_signal = False
-                    restored = True
-                    restored_id = blk_item.idx
-                    break
+
+        # Clear text undo stack: the pool recycles TextBlkItem instances, so any QUndoCommand
+        # holding strong references to old items would mutate the wrong page's data on Ctrl+Z.
+        # Some callers (merge_pages, on_merge_finished, on_fin_import_doc, retranslation-no-pagechange)
+        # don't clear it themselves, so we clear it unconditionally here to make pool reuse safe.
+        if hasattr(self.canvas, 'text_undo_stack') and self.canvas.text_undo_stack is not None:
+            self.canvas.text_undo_stack.clear()
+
+        # Suppress canvas/view repaints while we batch-swap items to avoid
+        # paint storms when a page has 50-100+ text blocks.
+        gv = self.canvas.gv if hasattr(self.canvas, 'gv') else None
+        viewport = gv.viewport() if gv is not None else None
+        if viewport is not None:
+            viewport.setUpdatesEnabled(False)
+
+        debug_timing = bool(getattr(shared, 'DEBUG', False))
+        t_clear = t_build = 0.0
+        if debug_timing:
+            t0 = time.perf_counter()
+
+        try:
+            self.clearSceneTextitems()
+
+            if debug_timing:
+                t1 = time.perf_counter()
+                t_clear = t1 - t0
+
+            block_list = self.imgtrans_proj.current_block_list()
+            if block_list is not None:
+                default_family = self.formatpanel.familybox.currentText()
+                for textblock in block_list:
+                    if textblock.font_family is None or textblock.font_family.strip() == '':
+                        textblock.font_family = default_family
+                    self.addTextBlock(textblock)
+
+            if self.auto_textlayout_flag:
+                self.updateTextBlkList()
+
+            # Ensure text block display mode is properly restored after updating scene items.
+            # This prevents the blue rectangles from being hidden after page changes.
+            display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
+            self.showTextblkItemRect(display_mode)
+
+            # Restore selection (all items) so multi-select survives, and re-bind
+            # the shape control target so the dashed selection frame reappears.
+            shape_target = None
+            if selected_item_ids and self.textblk_item_list:
+                wanted = set(selected_item_ids)
+                for blk_item in self.textblk_item_list:
+                    if blk_item.idx in wanted:
+                        blk_item.setSelected(True)
+                        if blk_item.idx == prev_shape_target_idx:
+                            shape_target = blk_item
+                if shape_target is None:
+                    # Previous shape target wasn't selected (or wasn't in the
+                    # selection set); fall back to the first restored selection
+                    # so the user still sees a frame.
+                    for blk_item in self.textblk_item_list:
+                        if blk_item.idx in wanted:
+                            shape_target = blk_item
+                            break
+            if shape_target is not None:
+                self.txtblkShapeControl.setBlkItem(shape_target)
+        finally:
+            self.canvas.block_selection_signal = prev_block_sel
+            if viewport is not None:
+                viewport.setUpdatesEnabled(True)
+                viewport.update()
+
+        # Resync panels with the restored selection now that the scene state
+        # is consistent. Done outside block_selection_signal so the formatpanel
+        # actually receives the update.
+        if not self.canvas.block_selection_signal:
+            self.on_incanvas_selection_changed()
+
+        if debug_timing:
+            t2 = time.perf_counter()
+            t_build = t2 - t1 if t_clear else t2 - t0
+            try:
+                from utils.logger import logger as _logger
+                _logger.debug(f"[updateSceneTextitems] clear={t_clear*1000:.1f}ms build={t_build*1000:.1f}ms blocks={len(self.textblk_item_list)} pool_blk={len(self._blk_pool)} pool_pw={len(self._pw_pool)}")
+            except Exception:
+                pass
 
     def addTextBlock(self, blk: Union[TextBlock, TextBlkItem] = None) -> TextBlkItem:
         if isinstance(blk, TextBlkItem):
             blk_item = blk
             blk_item.idx = len(self.textblk_item_list)
-        else:
-            
-            translation = ''
-            if self.auto_textlayout_flag and not blk.vertical:
-                translation = blk.translation
-                blk.translation = ''
-            # Use pcfg.imgtrans_textblock as the source of truth for display state
-            # This ensures text blocks respect the user's display preference
-            display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
-            blk_item = TextBlkItem(blk, len(self.textblk_item_list), show_rect=display_mode)
-            
-            
-            if translation:
-                blk.translation = translation
-                rst = self.layout_textblk(blk_item, text=translation)
-                if rst is None:
-                    blk_item.setPlainText(translation)
-        self.addTextBlkItem(blk_item)
+            self.addTextBlkItem(blk_item)
+            blk_for_pair = blk_item.blk
+            pair_widget = TransPairWidget(blk_for_pair, len(self.pairwidget_list), pcfg.fold_textarea)
+            self.pairwidget_list.append(pair_widget)
+            self.textEditList.addPairWidget(pair_widget)
+            self._wire_pair_widget(pair_widget, blk_item, fresh=True)
+            self.new_textblk.emit(blk_item.idx)
+            return blk_item
 
-        pair_widget = TransPairWidget(blk, len(self.pairwidget_list), pcfg.fold_textarea)
-        self.pairwidget_list.append(pair_widget)
-        self.textEditList.addPairWidget(pair_widget)
+        translation = ''
+        if self.auto_textlayout_flag and not blk.vertical:
+            translation = blk.translation
+            blk.translation = ''
+
+        display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
+        new_idx = len(self.textblk_item_list)
+
+        # Pool reuse path: a recycled item already has its signals wired so we
+        # skip addTextBlkItem (which would double-connect) and just re-attach it
+        # to the scene after resetting its content.
+        pooled = self._pool_acquire_blk_item()
+        if pooled is not None:
+            blk_item = pooled
+            blk_item.reset_with_blk(blk, new_idx, show_rect=display_mode)
+            self.textblk_item_list.append(blk_item)
+            blk_item.setParentItem(self.canvas.textLayer)
+            blk_item.setVisible(True)
+        else:
+            blk_item = TextBlkItem(blk, new_idx, show_rect=display_mode)
+            self.addTextBlkItem(blk_item)
+
+        if translation:
+            blk.translation = translation
+            rst = self.layout_textblk(blk_item, text=translation)
+            if rst is None:
+                blk_item.setPlainText(translation)
+
+        # Pool reuse path for the pair widget: signals already wired, just
+        # reset text content + re-insert into the layout.
+        pooled_pw = self._pool_acquire_pair_widget()
+        if pooled_pw is not None:
+            pair_widget = pooled_pw
+            pair_widget.textblock = blk
+            pair_widget.idx = len(self.pairwidget_list)
+            pair_widget.idx_label.setText(str(pair_widget.idx + 1).zfill(2))
+            pair_widget.e_source.idx = pair_widget.idx
+            pair_widget.e_trans.idx = pair_widget.idx
+            self.pairwidget_list.append(pair_widget)
+            self.textEditList.insertPairWidget(pair_widget, pair_widget.idx)
+            self._wire_pair_widget(pair_widget, blk_item, fresh=False)
+            # Clear stale per-widget undo history AFTER setPlainText so Ctrl+Z
+            # on a recycled editor cannot replay edits from a different page
+            # (and also discards the just-now setPlainText as an undo step).
+            pair_widget.e_source.document().clearUndoRedoStacks()
+            pair_widget.e_trans.document().clearUndoRedoStacks()
+            pair_widget.e_source.old_undo_steps = pair_widget.e_source.document().availableUndoSteps()
+            pair_widget.e_trans.old_undo_steps = pair_widget.e_trans.document().availableUndoSteps()
+        else:
+            pair_widget = TransPairWidget(blk, len(self.pairwidget_list), pcfg.fold_textarea)
+            self.pairwidget_list.append(pair_widget)
+            self.textEditList.addPairWidget(pair_widget)
+            self._wire_pair_widget(pair_widget, blk_item, fresh=True)
+
+        self.new_textblk.emit(blk_item.idx)
+        return blk_item
+
+    def _wire_pair_widget(self, pair_widget: 'TransPairWidget', blk_item: TextBlkItem, fresh: bool):
+        # Set per-page text content. fresh=False means widget came from the pool
+        # and signals are already connected -- skip re-connecting to avoid
+        # duplicate slot invocations on edit.
         pair_widget.e_source.setPlainText(blk_item.blk.get_text())
+        pair_widget.e_trans.setPlainText(blk_item.toPlainText())
+        if not fresh:
+            return
+
         pair_widget.e_source.focus_in.connect(self.on_transwidget_focus_in)
         pair_widget.e_source.ensure_scene_visible.connect(self.on_ensure_textitem_svisible)
         pair_widget.e_source.push_undo_stack.connect(self.on_push_edit_stack)
@@ -505,7 +697,6 @@ class SceneTextManager(QObject):
         pair_widget.e_source.show_select_menu.connect(self.on_show_select_menu)
         pair_widget.e_source.focus_out.connect(self.on_pairw_focusout)
 
-        pair_widget.e_trans.setPlainText(blk_item.toPlainText())
         pair_widget.e_trans.focus_in.connect(self.on_transwidget_focus_in)
         pair_widget.e_trans.propagate_user_edited.connect(self.on_propagate_transwidget_edit)
         pair_widget.e_trans.ensure_scene_visible.connect(self.on_ensure_textitem_svisible)
@@ -517,9 +708,6 @@ class SceneTextManager(QObject):
         pair_widget.drag_move.connect(self.textEditList.handle_drag_pos)
         pair_widget.pw_drop.connect(self.textEditList.on_pw_dropped)
         pair_widget.idx_edited.connect(self.textEditList.on_idx_edited)
-
-        self.new_textblk.emit(blk_item.idx)
-        return blk_item
 
     def addTextBlkItem(self, textblk_item: TextBlkItem) -> TextBlkItem:
         self.textblk_item_list.append(textblk_item)

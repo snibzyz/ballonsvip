@@ -38,6 +38,9 @@ class ThreadBase(QThread):
 class ImgSaveThread(ThreadBase):
 
     img_writed = Signal(str)
+    # autosave_item_done emits after every queued autosave item finishes encoding+writing,
+    # letting the UI layer track when an autosave round has fully drained from this thread.
+    autosave_item_done = Signal()
     _thread_exception_type = 'ImgSaveThread'
     _thread_error_msg = 'Failed to save image.'
 
@@ -45,8 +48,10 @@ class ImgSaveThread(ThreadBase):
         super().__init__(*args, **kwargs)
         self.im_save_list = []
 
-    def saveImg(self, save_path: str, img: QImage, pagename_in_proj: str = '', save_params: dict = None, keep_alpha=False):
-        self.im_save_list.append((save_path, img, pagename_in_proj, save_params, keep_alpha))
+    def saveImg(self, save_path: str, img: QImage, pagename_in_proj: str = '', save_params: dict = None, keep_alpha=False, is_autosave: bool = False):
+        # is_autosave is tracked per-item so the UI can keep an in-flight guard for
+        # autosave rounds without waiting on unrelated manual-save items in the queue.
+        self.im_save_list.append((save_path, img, pagename_in_proj, save_params, keep_alpha, is_autosave))
         if self.job is None:
             self.job = self._save_img
             self.start()
@@ -55,7 +60,7 @@ class ImgSaveThread(ThreadBase):
         while True:
             if len(self.im_save_list) == 0:
                 break
-            save_path, img, pagename_in_proj, save_params, keep_alpha = self.im_save_list[0]
+            save_path, img, pagename_in_proj, save_params, keep_alpha, is_autosave = self.im_save_list[0]
             if save_params is None:
                 save_params = {}
             if isinstance(img, QImage) or isinstance(img, QPixmap):
@@ -63,10 +68,15 @@ class ImgSaveThread(ThreadBase):
             imwrite(save_path, img, **save_params)
             self.img_writed.emit(pagename_in_proj)
             self.im_save_list.pop(0)
+            if is_autosave:
+                self.autosave_item_done.emit()
 
     def on_exec_failed(self):
         if len(self.im_save_list) > 0:
-            self.im_save_list.pop(0)
+            failed_item = self.im_save_list.pop(0)
+            # Always notify autosave tracking on failure so the in-flight counter cannot leak.
+            if len(failed_item) >= 6 and failed_item[5]:
+                self.autosave_item_done.emit()
             if len(self.im_save_list) == 0:
                 self.job = None
             else:

@@ -85,12 +85,21 @@ class MainWindow(mainwindow_cls):
         self.backup_blkstyles = []
         self._run_imgtrans_wo_textstyle_update = False
 
-        # Setup autosave timer (3 seconds after changes)
+        # Setup autosave timer (10s sweet spot: long enough to avoid UI hitches from rapid edits,
+        # short enough to keep autosave protection useful).
         from qtpy.QtCore import QTimer
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.timeout.connect(self.on_autosave_timeout)
-        self.autosave_timer.setInterval(3000)  # 3 seconds
+        self.autosave_timer.setInterval(10000)
+
+        # In-flight guard: counts autosave-tagged items still pending in imsave_thread.
+        # Prevents a new autosave round from stacking on top of an unfinished one
+        # (which would cause queue pile-up and visible UI hitches).
+        self._autosave_pending = 0
+        # Re-entrancy guard for the deferred render step itself (between the
+        # singleShot scheduling and the actual saveCurrentPage call running).
+        self._autosave_running = False
 
         self.setupThread()
         self.setupUi()
@@ -129,10 +138,19 @@ class MainWindow(mainwindow_cls):
 
     def setupThread(self):
         self.imsave_thread = ImgSaveThread()
+        # Force QueuedConnection: signal is emitted from the worker run() loop, but the
+        # ImgSaveThread instance lives on the main thread, so AutoConnection would resolve
+        # to DirectConnection and race with the main-thread `_autosave_pending += 1`.
+        self.imsave_thread.autosave_item_done.connect(self._on_autosave_item_done, Qt.ConnectionType.QueuedConnection)
         self.export_doc_thread = ExportDocThread()
         self.export_doc_thread.fin_io.connect(self.on_fin_export_doc)
         self.import_doc_thread = ImportDocThread(self)
         self.import_doc_thread.fin_io.connect(self.on_fin_import_doc)
+
+    def _on_autosave_item_done(self):
+        # Decrement guard; clamp at zero in case an exception path emitted extra signals.
+        if self._autosave_pending > 0:
+            self._autosave_pending -= 1
 
     def resetStyleSheet(self, reverse_icon: bool = False):
         theme = 'eva-dark' if pcfg.darkmode else 'eva-light'
@@ -1292,7 +1310,10 @@ class MainWindow(mainwindow_cls):
         self.app.processEvents()
         self.save_on_page_changed = original_save_on_page_changed
 
-    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False):
+    def saveCurrentPage(self, update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, keep_exist_as_backup=False, _is_autosave=False):
+        # _is_autosave is internal: when True, queued image writes are tagged so the
+        # autosave in-flight guard can track them. Manual saves leave it False so they
+        # behave exactly as before (no behavior change for Ctrl+S / save button).
         if not self.imgtrans_proj.img_valid:
             return
         
@@ -1333,7 +1354,10 @@ class MainWindow(mainwindow_cls):
                     mask_path = self.imgtrans_proj.get_mask_path()
                     mask_array = self.imgtrans_proj.mask_array
                     if mask_array is not None:
-                        self.imsave_thread.saveImg(mask_path, mask_array, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality})
+                        # Increment AFTER successful enqueue so an exception cannot leak the counter and stall future autosaves
+                        self.imsave_thread.saveImg(mask_path, mask_array, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, is_autosave=_is_autosave)
+                        if _is_autosave:
+                            self._autosave_pending += 1
                     inpainted_path = self.imgtrans_proj.get_inpainted_path()
                     if self.canvas.drawingLayer.drawed():
                         inpainted = self.canvas.base_pixmap.copy()
@@ -1343,7 +1367,9 @@ class MainWindow(mainwindow_cls):
                     else:
                         inpainted = self.imgtrans_proj.inpainted_array
                     if inpainted is not None:
-                        self.imsave_thread.saveImg(inpainted_path, inpainted, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
+                        self.imsave_thread.saveImg(inpainted_path, inpainted, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha(), is_autosave=_is_autosave)
+                        if _is_autosave:
+                            self._autosave_pending += 1
             except Exception as e:
                 LOGGER.error(f"Failed to save project files: {e}")
 
@@ -1354,7 +1380,9 @@ class MainWindow(mainwindow_cls):
             img = self.canvas.render_result_img(preserve_selection=preserve_selection)
             imsave_path = self.imgtrans_proj.get_result_path(self.imgtrans_proj.current_img)
             self.imgtrans_proj.cleanup_stale_output_files(self.imgtrans_proj.current_img, targets={'result'})
-            self.imsave_thread.saveImg(imsave_path, img, self.imgtrans_proj.current_img, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha())
+            self.imsave_thread.saveImg(imsave_path, img, self.imgtrans_proj.current_img, save_params={'ext': pcfg.imgsave_ext, 'quality': pcfg.imgsave_quality}, keep_alpha=self.imgtrans_proj.current_has_alpha(), is_autosave=_is_autosave)
+            if _is_autosave:
+                self._autosave_pending += 1
         except Exception as e:
             LOGGER.error(f"Failed to render and save result image: {e}")
         
@@ -1714,66 +1742,75 @@ class MainWindow(mainwindow_cls):
             self.autosave_timer.start()
     
     def on_autosave_timeout(self):
-        """Auto-save after 3 seconds of inactivity"""
-        if self.canvas.projstate_unsaved and not self.page_changing and not self.opening_dir:
-            if self.imgtrans_proj.img_valid:
-                # Save the current text block display state and selection state before autosave
-                should_show_rect = getattr(pcfg, 'imgtrans_textblock', False)
-                # Save current selection state to restore after autosave
-                # Autosave should NOT affect selection - it's just a save operation
-                selected_text_items = self.canvas.selected_text_items()
-                selected_item_ids = [item.idx for item in selected_text_items]
-                # Save shape control state before autosave
-                # Autosave should NOT affect UI - it's just a save operation
-                shape_control_visible = self.st_manager.txtblkShapeControl.isVisible()
-                shape_control_blk_item_id = None
-                if shape_control_visible and self.st_manager.txtblkShapeControl.blk_item is not None:
-                    shape_control_blk_item_id = self.st_manager.txtblkShapeControl.blk_item.idx
-                # Auto-save current page
-                # IMPORTANT: restore_interface=False means we need to manually restore text block display state
-                # after autosave to prevent the blue rectangles from disappearing
-                # Selection will be preserved automatically by render_result_img() when preserve_selection=True
-                self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False)
-                
-                # IMPORTANT: Restore selection after autosave
-                # render_result_img() clears selection, so we need to restore it explicitly
-                if len(selected_item_ids) > 0:
-                    self.canvas.block_selection_signal = True
-                    for blk_item in self.st_manager.textblk_item_list:
-                        if blk_item.idx in selected_item_ids:
-                            blk_item.setSelected(True)
-                    self.canvas.block_selection_signal = False
-                    # Also restore textEditList selection state
-                    self.st_manager.textEditList.set_selected_list(selected_item_ids)
-                # ALWAYS restore canvas focus after autosave to ensure keyboard shortcuts work
-                # Autosave should not affect focus - it's just a save operation
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-                
-                # Restore shape control state after autosave
-                # Autosave should NOT affect UI - it's just a save operation
-                if shape_control_visible and shape_control_blk_item_id is not None:
-                    # Find the text block item and restore shape control
-                    for blk_item in self.st_manager.textblk_item_list:
-                        if blk_item.idx == shape_control_blk_item_id:
-                            self.st_manager.txtblkShapeControl.setBlkItem(blk_item)
-                            break
-                elif shape_control_visible:
-                    # Shape control was visible but no blk_item - just show it
-                    self.st_manager.txtblkShapeControl.show()
-                # ALWAYS restore text block display state after autosave if it was enabled
-                # This ensures the blue rectangles remain visible after autosave
-                if should_show_rect:
-                    # Restore draw_rect state for all text blocks
-                    self.st_manager.showTextblkItemRect(True)
-                    # Sync canvas textblock_mode to match
-                    if not self.canvas.textblock_mode:
-                        self.canvas.textblock_mode = True
-                # ALWAYS restore canvas focus after autosave to ensure keyboard shortcuts work
-                # This is critical for shortcuts like Ctrl+A, A, D, W to function properly
-                # Restore focus regardless of text block display state
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
+        # Dirty-flag guard: canvas.projstate_unsaved already tracks whether anything has
+        # changed since the last successful save, so if it's clean we can skip the entire
+        # render+encode pipeline and avoid pointless work.
+        if not self.canvas.projstate_unsaved or self.page_changing or self.opening_dir:
+            return
+        if not self.imgtrans_proj.img_valid:
+            return
+        # In-flight guard: a previous autosave round is still draining through imsave_thread.
+        # Skipping here prevents queue pile-up that would otherwise compound UI hitches and
+        # can also reorder writes across pages. The next save_state change will reschedule us.
+        if self._autosave_pending > 0 or self._autosave_running:
+            return
+
+        self._autosave_running = True
+        # Defer the heavy main-thread work (scene render in saveCurrentPage) to the next
+        # event-loop tick. The timer's timeout slot returns immediately, letting Qt flush
+        # any queued paint events from the user's last interaction before we monopolise
+        # the main thread for the render. Encode+write itself is already offloaded to
+        # imsave_thread, so the only remaining synchronous cost is the unavoidable
+        # QGraphicsScene.render() (Qt requires this on the main thread).
+        from qtpy.QtCore import QTimer
+        QTimer.singleShot(0, self._run_autosave_now)
+
+    def _run_autosave_now(self):
+        try:
+            # Re-check guards: state may have changed between scheduling and firing
+            # (e.g. user started navigating to another page).
+            if self.page_changing or self.opening_dir or not self.imgtrans_proj.img_valid:
+                return
+            if not self.canvas.projstate_unsaved:
+                return
+
+            should_show_rect = getattr(pcfg, 'imgtrans_textblock', False)
+            selected_text_items = self.canvas.selected_text_items()
+            selected_item_ids = [item.idx for item in selected_text_items]
+            shape_control_visible = self.st_manager.txtblkShapeControl.isVisible()
+            shape_control_blk_item_id = None
+            if shape_control_visible and self.st_manager.txtblkShapeControl.blk_item is not None:
+                shape_control_blk_item_id = self.st_manager.txtblkShapeControl.blk_item.idx
+
+            self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False, _is_autosave=True)
+
+            if len(selected_item_ids) > 0:
+                self.canvas.block_selection_signal = True
+                for blk_item in self.st_manager.textblk_item_list:
+                    if blk_item.idx in selected_item_ids:
+                        blk_item.setSelected(True)
+                self.canvas.block_selection_signal = False
+                self.st_manager.textEditList.set_selected_list(selected_item_ids)
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+
+            if shape_control_visible and shape_control_blk_item_id is not None:
+                for blk_item in self.st_manager.textblk_item_list:
+                    if blk_item.idx == shape_control_blk_item_id:
+                        self.st_manager.txtblkShapeControl.setBlkItem(blk_item)
+                        break
+            elif shape_control_visible:
+                self.st_manager.txtblkShapeControl.show()
+            if should_show_rect:
+                self.st_manager.showTextblkItemRect(True)
+                if not self.canvas.textblock_mode:
+                    self.canvas.textblock_mode = True
+            if not self.canvas.gv.hasFocus():
+                self.canvas.gv.setFocus()
+        finally:
+            # Always release the running flag even if saveCurrentPage raised; the
+            # in-flight pending counter is still authoritative for queued writes.
+            self._autosave_running = False
 
     def on_textstack_changed(self):
         if not self.page_changing:

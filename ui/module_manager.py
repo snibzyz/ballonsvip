@@ -61,7 +61,14 @@ class ModuleThread(QThread):
             if not pcfg.module.load_model_on_demand:
                 self.module.load_model()
             if old_module is not None:
+                try:
+                    if hasattr(old_module, 'unload_model'):
+                        old_module.unload_model()
+                except Exception:
+                    pass
                 del old_module
+                # release VRAM held by previous module
+                soft_empty_cache()
         except Exception as e:
             self.module = old_module
             create_error_dialog(e, self._failed_set_module_msg)
