@@ -265,15 +265,22 @@ class RearrangeBlksCommand(QUndoCommand):
     def rearange_blk_ids(self, src_ids, tgt_ids, visible_idx = None):
         src_ids = np.array(src_ids)
         tgt_ids = np.array(tgt_ids)
+        if src_ids.size == 0:
+            # Nothing to move. Avoids the `pw.height()` reference at the
+            # bottom (pw is loop-local) when the redo/undo replays an
+            # empty permutation -- previously raised NameError.
+            return
         src_order_ids = np.argsort(src_ids)[::-1]
 
         src_ids = src_ids[src_order_ids]
         tgt_ids = tgt_ids[src_order_ids]
-        
+
         blks: List[TextBlkItem] = []
         pws: List[TransPairWidget] = []
+        last_pw = None
         for pos, pos_tgt in zip(src_ids, tgt_ids):
             pw = self.ctrl.pairwidget_list.pop(pos)
+            last_pw = pw
             if visible_idx == pos_tgt:
                 pw.hide()
             blk = self.ctrl.textblk_item_list.pop(pos)
@@ -284,15 +291,20 @@ class RearrangeBlksCommand(QUndoCommand):
         for ii in tgt_order_ids:
             pos = tgt_ids[ii]
             self.ctrl.textblk_item_list.insert(pos, blks[ii])
-            
+
             self.ctrl.textEditList.insertPairWidget(pws[ii], pos)
             self.ctrl.pairwidget_list.insert(pos, pws[ii])
 
-        self.ctrl.updateTextBlkItemIdx(set(tgt_ids))
+        self.ctrl.updateTextBlkItemIdx(set(int(t) for t in tgt_ids))
         if visible_idx is not None:
-            pw_ct = self.ctrl.pairwidget_list[visible_idx]
-            pw_ct.show()
-            self.ctrl.textEditList.ensureWidgetVisible(pw_ct, yMargin=pw.height())
+            # Bounds check: callers (textEditList drag flow) compute visible_idx
+            # before the rearrange, so a deletion in flight could leave it
+            # pointing past the end. Skip silently rather than IndexError.
+            if 0 <= int(visible_idx) < len(self.ctrl.pairwidget_list):
+                pw_ct = self.ctrl.pairwidget_list[int(visible_idx)]
+                pw_ct.show()
+                anchor_h = last_pw.height() if last_pw is not None else pw_ct.height()
+                self.ctrl.textEditList.ensureWidgetVisible(pw_ct, yMargin=anchor_h)
 
 class TextPanel(Widget):
     def __init__(self, app: QApplication, *args, **kwargs) -> None:
@@ -330,6 +342,16 @@ class SceneTextManager(QObject):
         self.canvas.layout_textblks.connect(self.onAutoLayoutTextblks)
         self.canvas.reset_angle.connect(self.onResetAngle)
         self.canvas.squeeze_blk.connect(self.onSqueezeBlk)
+        # Reorder context-menu actions reuse the same handlers as the keyboard
+        # shortcuts so menu / keyboard / drag stay consistent. Resolution of
+        # "which block to move" happens in onCanvasReorderRequested via the
+        # standard selection -> shape control fallback chain.
+        self.canvas.reorder_to_top.connect(lambda: self.onCanvasReorderRequested('top'))
+        self.canvas.reorder_up.connect(lambda: self.onCanvasReorderRequested('up'))
+        self.canvas.reorder_down.connect(lambda: self.onCanvasReorderRequested('down'))
+        self.canvas.reorder_to_bottom.connect(lambda: self.onCanvasReorderRequested('bottom'))
+        self.canvas.reorder_to_position.connect(lambda: self.onCanvasReorderRequested('position'))
+        self.canvas.reorder_auto_sort.connect(lambda: self.onCanvasReorderRequested('auto_sort'))
         self.canvas.incanvas_selection_changed.connect(self.on_incanvas_selection_changed)
         self.txtblkShapeControl = canvas.txtblkShapeControl
         self.textpanel = textpanel
@@ -360,6 +382,16 @@ class SceneTextManager(QObject):
         self._pw_pool: List[TransPairWidget] = []
         self._pool_max_size: int = 100
 
+        # Badge drag-reorder state. None when no drag in progress; populated by
+        # onBadgeDragStarted, mutated by onBadgeDragging, cleared on end/cancel.
+        self._badge_drag_src = None
+        self._badge_drag_target = None
+
+        # Quick-reorder popup (Ctrl+J / "Move to position..." context action).
+        # Only ever one popup at a time; spawn replaces any prior popup.
+        self._quick_reorder_popup = None
+        self._quick_reorder_src_idx = None
+
     def on_switch_textitem(self, switch_delta: int, key_event: QKeyEvent = None, current_editing_widget: Union[SourceTextEdit, TransTextEdit] = None):
         n_blk = len(self.textblk_item_list)
         if n_blk < 1:
@@ -383,7 +415,9 @@ class SceneTextManager(QObject):
             tgt_idx += n_blk
         elif tgt_idx >= n_blk:
             tgt_idx -= n_blk
-        blk = self.textblk_item_list[tgt_idx]
+        blk = self._safe_blk_item(tgt_idx)
+        if blk is None:
+            return
 
         if current_editing_widget is None:
             if editing_blk is None:
@@ -393,8 +427,9 @@ class SceneTextManager(QObject):
                 self.canvas.block_selection_signal = False
                 self.canvas.gv.ensureVisible(blk)
                 self.txtblkShapeControl.setBlkItem(blk)
-                edit = self.pairwidget_list[tgt_idx].e_trans
-                self.changeHoveringWidget(edit)
+                pw = self._safe_pair_widget(tgt_idx)
+                if pw is not None:
+                    self.changeHoveringWidget(pw.e_trans)
                 self.textEditList.set_selected_list([blk.idx])
             else:
                 editing_blk.endEdit()
@@ -404,8 +439,12 @@ class SceneTextManager(QObject):
                 blk.startEdit()
                 self.canvas.gv.ensureVisible(blk)
         else:
-            self.textblk_item_list[current_editing_widget.idx].setSelected(False)
-            current_pw = self.pairwidget_list[tgt_idx]
+            cur_blk = self._safe_blk_item(getattr(current_editing_widget, 'idx', -1))
+            if cur_blk is not None:
+                cur_blk.setSelected(False)
+            current_pw = self._safe_pair_widget(tgt_idx)
+            if current_pw is None:
+                return
             is_trans = isinstance(current_editing_widget, TransTextEdit)
             if is_trans:
                 w = current_pw.e_trans
@@ -460,6 +499,10 @@ class SceneTextManager(QObject):
             # a stale "I'm under shape control" flag (would mis-route
             # squeezeBoundingRect, set_size etc.).
             blkitem.under_ctrl = False
+            # Clear any in-progress drag-reorder highlight so a recycled badge
+            # does not paint with stale red/yellow borders next page.
+            if getattr(blkitem, 'number_badge', None) is not None:
+                blkitem.number_badge.set_highlight(0)
             blkitem.setVisible(False)
             # Detaching from the scene avoids paint/hit-test cost while pooled.
             if blkitem.scene() is not None:
@@ -489,6 +532,9 @@ class SceneTextManager(QObject):
         return None
 
     def clearSceneTextitems(self):
+        # Cancel any in-progress badge drag so stale src/target indices from the
+        # previous page can't leak into the next page's reorder logic.
+        self.cancel_badge_drag()
         self.hovering_transwidget = None
         self.txtblkShapeControl.setBlkItem(None)
         # Pool live items rather than destroying them so updateSceneTextitems can
@@ -564,9 +610,13 @@ class SceneTextManager(QObject):
             if self.auto_textlayout_flag:
                 self.updateTextBlkList()
 
-            # Ensure text block display mode is properly restored after updating scene items.
-            # This prevents the blue rectangles from being hidden after page changes.
-            display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
+            # Outline is ON by default. The only way to False is the user
+            # pressing W (which flips pcfg.imgtrans_textblock). Read pcfg
+            # directly so freshly-added blocks always render an outline unless
+            # the user explicitly toggled them off -- previously OR'ing with
+            # canvas.textblock_mode let the two flags drift out of sync and
+            # silently leave a single block without an outline.
+            display_mode = bool(getattr(pcfg, 'imgtrans_textblock', True))
             self.showTextblkItemRect(display_mode)
 
             # Restore selection (all items) so multi-select survives, and re-bind
@@ -628,7 +678,12 @@ class SceneTextManager(QObject):
             translation = blk.translation
             blk.translation = ''
 
-        display_mode = getattr(pcfg, 'imgtrans_textblock', self.canvas.textblock_mode)
+        # Outline is ON by default; the only path to False is W toggling
+        # pcfg.imgtrans_textblock. Reading pcfg directly avoids the desync
+        # bug where a fresh block (manual create / pipeline / pool reuse)
+        # silently lacked an outline because canvas.textblock_mode and pcfg
+        # had drifted apart mid-flow.
+        display_mode = bool(getattr(pcfg, 'imgtrans_textblock', True))
         new_idx = len(self.textblk_item_list)
 
         # Pool reuse path: a recycled item already has its signals wired so we
@@ -637,10 +692,21 @@ class SceneTextManager(QObject):
         pooled = self._pool_acquire_blk_item()
         if pooled is not None:
             blk_item = pooled
+            # _pool_release_blk_item raised blockSignals(True) to silence the
+            # teardown phase. Append to the list FIRST while signals are still
+            # blocked, then unblock -- otherwise reset_with_blk's reconnect of
+            # documentSizeChanged can emit doc_size_changed before the item is
+            # in textblk_item_list, and onTextBlkItemSizeChanged crashes with
+            # IndexError trying to look up the new idx.
             blk_item.reset_with_blk(blk, new_idx, show_rect=display_mode)
             self.textblk_item_list.append(blk_item)
             blk_item.setParentItem(self.canvas.textLayer)
             blk_item.setVisible(True)
+            blk_item.blockSignals(False)
+            # Re-sync badge visibility with the current pcfg toggle: pooled items
+            # could have been hidden by an earlier "N" press on a different page.
+            if getattr(blk_item, 'number_badge', None) is not None:
+                blk_item.number_badge.setVisible(getattr(pcfg, 'show_textblock_number', True))
         else:
             blk_item = TextBlkItem(blk, new_idx, show_rect=display_mode)
             self.addTextBlkItem(blk_item)
@@ -726,9 +792,29 @@ class SceneTextManager(QObject):
         textblk_item.propagate_user_edited.connect(self.on_propagate_textitem_edit)
         textblk_item.doc_size_changed.connect(self.onTextBlkItemSizeChanged)
         textblk_item.pasted.connect(self.onBlkitemPaste)
+        # Badge signals are wired once per TextBlkItem instance. Pool reuse
+        # keeps these connections intact -- reset_with_blk only refreshes the
+        # badge's text/highlight, never rebuilds the badge object.
+        if getattr(textblk_item, 'number_badge', None) is not None:
+            badge = textblk_item.number_badge
+            badge.badge_clicked.connect(self.onBadgeClicked)
+            badge.badge_drag_started.connect(self.onBadgeDragStarted)
+            badge.badge_dragging.connect(self.onBadgeDragging)
+            badge.badge_drag_ended.connect(self.onBadgeDragEnded)
+            # Context menu actions: reorder requests + auto-sort + visibility
+            # toggle. Wired once per item; pool reuse preserves these.
+            badge.move_to_position_requested.connect(self.move_block_to_position)
+            badge.quick_reorder_requested.connect(self.open_quick_reorder_popup)
+            badge.auto_sort_requested.connect(self.auto_sort_reading_order)
+            badge.toggle_numbers_requested.connect(self.toggle_numbers_visible)
+            badge.setVisible(getattr(pcfg, 'show_textblock_number', True))
         return textblk_item
 
     def deleteTextblkItemList(self, blkitem_list: List[TextBlkItem], p_widget_list: List[TransPairWidget]):
+        # Dismiss any open quick-reorder popup -- its captured src_idx may
+        # point at a block being deleted, leaving the popup ghosted.
+        # Also cancel any badge drag for the same reason.
+        self.cancel_badge_drag()
         selection_changed = False
         for blkitem, p_widget in zip(blkitem_list, p_widget_list):
             if blkitem.isSelected():
@@ -756,8 +842,28 @@ class SceneTextManager(QObject):
         self.on_incanvas_selection_changed()
         self.canvas.block_selection_signal = False
         
+    def _safe_blk_item(self, idx: int):
+        # Pooled TextBlkItems can fire signals with a stale idx during page
+        # rebuilds (their layout/document signals reconnect mid-acquire and
+        # may emit before textblk_item_list is repopulated). Every external
+        # signal handler that indexes by id should route through this guard.
+        if not isinstance(idx, int):
+            return None
+        if 0 <= idx < len(self.textblk_item_list):
+            return self.textblk_item_list[idx]
+        return None
+
+    def _safe_pair_widget(self, idx: int):
+        if not isinstance(idx, int):
+            return None
+        if 0 <= idx < len(self.pairwidget_list):
+            return self.pairwidget_list[idx]
+        return None
+
     def onTextBlkItemSizeChanged(self, idx: int):
-        blk_item = self.textblk_item_list[idx]
+        blk_item = self._safe_blk_item(idx)
+        if blk_item is None:
+            return
         if not self.txtblkShapeControl.reshaping:
             if self.txtblkShapeControl.blk_item == blk_item:
                 self.txtblkShapeControl.updateBoundingRect()
@@ -767,26 +873,40 @@ class SceneTextManager(QObject):
         return self.app.clipboard()
 
     def onBlkitemPaste(self, idx: int):
-        blk_item = self.textblk_item_list[idx]
+        blk_item = self._safe_blk_item(idx)
+        if blk_item is None:
+            return
         text = self.app_clipborad.text()
         cursor = blk_item.textCursor()
         cursor.insertText(text)
 
     def onTextBlkItemBeginEdit(self, blk_id: int):
-        blk_item = self.textblk_item_list[blk_id]
+        blk_item = self._safe_blk_item(blk_id)
+        if blk_item is None:
+            return
         self.txtblkShapeControl.setBlkItem(blk_item)
         self.canvas.editing_textblkitem = blk_item
         self.formatpanel.set_textblk_item(blk_item)
         self.txtblkShapeControl.startEditing()
-        e_trans = self.pairwidget_list[blk_item.idx].e_trans
-        self.changeHoveringWidget(e_trans)
+        pw = self._safe_pair_widget(blk_item.idx)
+        if pw is None:
+            return
+        self.changeHoveringWidget(pw.e_trans)
 
     def changeHoveringWidget(self, edit: SourceTextEdit):
         if self.hovering_transwidget is not None and self.hovering_transwidget != edit:
-            self.hovering_transwidget.setHoverEffect(False)
+            try:
+                self.hovering_transwidget.setHoverEffect(False)
+            except RuntimeError:
+                # Previous hovering widget was Qt-deleted by a page rebuild.
+                # Drop the dangling reference silently.
+                pass
         self.hovering_transwidget = edit
         if edit is not None:
-            pw = self.pairwidget_list[edit.idx]
+            # Guarded lookup: edit.idx can be stale during a paged rebuild.
+            pw = self._safe_pair_widget(getattr(edit, 'idx', -1))
+            if pw is None:
+                return
             h = pw.height()
             if shared.USE_PYSIDE6:
                 self.textEditList.ensureWidgetVisible(pw, ymargin=h)
@@ -795,13 +915,17 @@ class SceneTextManager(QObject):
             edit.setHoverEffect(True)
 
     def onLeftbuttonPressed(self, blk_id: int):
-        blk_item = self.textblk_item_list[blk_id]
+        blk_item = self._safe_blk_item(blk_id)
+        if blk_item is None:
+            return
         self.txtblkShapeControl.setBlkItem(blk_item)
         selections: List[TextBlkItem] = self.canvas.selectedItems()
         if len(selections) > 1:
             for item in selections:
                 item.oldPos = item.pos()
-        self.changeHoveringWidget(self.pairwidget_list[blk_id].e_trans)
+        pw = self._safe_pair_widget(blk_id)
+        if pw is not None:
+            self.changeHoveringWidget(pw.e_trans)
         # Ensure canvas maintains focus when clicking on text blocks
         # This prevents selection from being lost due to focus issues
         if not self.canvas.gv.hasFocus():
@@ -809,7 +933,10 @@ class SceneTextManager(QObject):
 
     def onTextBlkItemEndEdit(self, blk_id: int):
         self.canvas.editing_textblkitem = None
-        self.textblk_item_list[blk_id].setSelected(True)
+        blk_item = self._safe_blk_item(blk_id)
+        if blk_item is None:
+            return
+        blk_item.setSelected(True)
         self.txtblkShapeControl.endEditing()
 
     def editingTextItem(self) -> TextBlkItem:
@@ -828,7 +955,9 @@ class SceneTextManager(QObject):
     def onTextBlkItemHoverEnter(self, blk_id: int):
         if self.is_editting():
             return
-        blk_item = self.textblk_item_list[blk_id]
+        blk_item = self._safe_blk_item(blk_id)
+        if blk_item is None:
+            return
         if not blk_item.hasFocus():
             self.txtblkShapeControl.setBlkItem(blk_item)
 
@@ -913,13 +1042,21 @@ class SceneTextManager(QObject):
         old_html_lst, old_rect_lst, trans_widget_lst = [], [], []
         selected_blks = [blk for blk in selected_blks if not blk.fontformat.vertical]
         if len(selected_blks) > 0:
+            kept_blks = []
             for blkitem in selected_blks:
+                pw = self._safe_pair_widget(getattr(blkitem, 'idx', -1))
+                if pw is None:
+                    # Drop blocks whose pair widget is in flux; the operation
+                    # will simply act on the remaining valid set.
+                    continue
                 old_html_lst.append(blkitem.toHtml())
                 old_rect_lst.append(blkitem.absBoundingRect(qrect=True))
-                trans_widget_lst.append(self.pairwidget_list[blkitem.idx].e_trans)
+                trans_widget_lst.append(pw.e_trans)
                 self.layout_textblk(blkitem)
+                kept_blks.append(blkitem)
 
-            self.canvas.push_undo_command(AutoLayoutCommand(selected_blks, old_rect_lst, old_html_lst, trans_widget_lst))
+            if kept_blks:
+                self.canvas.push_undo_command(AutoLayoutCommand(kept_blks, old_rect_lst, old_html_lst, trans_widget_lst))
 
     def onResetAngle(self, reset_all: bool = False, items: List[TextBlkItem] = None):
         # If items list is provided, use it directly; otherwise use selected items
@@ -1188,8 +1325,20 @@ class SceneTextManager(QObject):
                     text_list = text_list + [text_list[-1]] * (num_blk - num_text)
                 text = text_list
         
-        etrans = [self.pairwidget_list[blkitem.idx].e_trans for blkitem in blkitems]
-        self.canvas.push_undo_command(MultiPasteCommand(text, blkitems, etrans))
+        # Drop blocks whose pair widget is missing (page rebuild in flight).
+        # The MultiPasteCommand expects 1:1 length parity between blkitems and
+        # etrans, so filter both sides together.
+        kept_blks = []
+        etrans = []
+        for blkitem in blkitems:
+            pw = self._safe_pair_widget(getattr(blkitem, 'idx', -1))
+            if pw is None:
+                continue
+            kept_blks.append(blkitem)
+            etrans.append(pw.e_trans)
+        if not kept_blks:
+            return
+        self.canvas.push_undo_command(MultiPasteCommand(text, kept_blks, etrans))
 
     def onRotateTextBlkItem(self, item: TextBlock):
         self.canvas.push_undo_command(RotateItemCommand(item))
@@ -1198,11 +1347,15 @@ class SceneTextManager(QObject):
         if self.is_editting():
             textitm = self.editingTextItem()
             textitm.endEdit()
-            self.pairwidget_list[textitm.idx].e_trans.setHoverEffect(False)
+            # Guard nested lookup; textitm could have been recycled into the
+            # pool by a signal storm before we get here.
+            pw_active = self._safe_pair_widget(getattr(textitm, 'idx', -1))
+            if pw_active is not None:
+                pw_active.e_trans.setHoverEffect(False)
             self.textEditList.clearAllSelected()
 
-        if idx < len(self.textblk_item_list):
-            blk_item = self.textblk_item_list[idx]
+        blk_item = self._safe_blk_item(idx)
+        if blk_item is not None:
             sender = self.sender()
             if isinstance(sender, TransTextEdit):
                 blk_item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
@@ -1234,30 +1387,48 @@ class SceneTextManager(QObject):
         if self.selectext_minimenu.isVisible():
             self.selectext_minimenu.hide()
         sender = self.sender()
-        if isinstance(sender, TransTextEdit) and idx < len(self.textblk_item_list):
-            blk_item = self.textblk_item_list[idx]
-            blk_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        if isinstance(sender, TransTextEdit):
+            blk_item = self._safe_blk_item(idx)
+            if blk_item is not None:
+                blk_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
 
     def on_push_textitem_undostack(self, num_steps: int, is_formatting: bool):
         blkitem: TextBlkItem = self.sender()
-        e_trans = self.pairwidget_list[blkitem.idx].e_trans if not is_formatting else None
+        # Guard with _safe_pair_widget: pooled blkitem may emit push_undo_stack
+        # mid-rebuild when the pairwidget at blkitem.idx has not yet been
+        # reattached. Without this we'd crash with IndexError on rapid page swap.
+        e_trans = None
+        if not is_formatting:
+            pw = self._safe_pair_widget(getattr(blkitem, 'idx', -1))
+            if pw is None:
+                return
+            e_trans = pw.e_trans
         self.canvas.push_undo_command(TextItemEditCommand(blkitem, e_trans, num_steps, self.textpanel.formatpanel), update_pushed_step=is_formatting)
 
     def on_push_edit_stack(self, num_steps: int):
         edit: Union[TransTextEdit, SourceTextEdit] = self.sender()
         is_trans = type(edit) == TransTextEdit
-        blkitem = self.textblk_item_list[edit.idx] if is_trans else None
+        blkitem = self._safe_blk_item(getattr(edit, 'idx', -1)) if is_trans else None
+        if is_trans and blkitem is None:
+            # The text-edit widget was orphaned (page rebuild in flight).
+            # Skip pushing -- the new page's undo stack is the right target.
+            return
         self.canvas.push_undo_command(TextEditCommand(edit, num_steps, blkitem), update_pushed_step=not is_trans)
 
     def on_propagate_textitem_edit(self, pos: int, added_text: str, joint_previous: bool):
         blk_item: TextBlkItem = self.sender()
-        edit = self.pairwidget_list[blk_item.idx].e_trans
+        pw = self._safe_pair_widget(getattr(blk_item, 'idx', -1))
+        if pw is None:
+            return
+        edit = pw.e_trans
         propagate_user_edit(blk_item, edit, pos, added_text, joint_previous)
         self.canvas.push_text_command(command=None, update_pushed_step=True)
 
     def on_propagate_transwidget_edit(self, pos: int, added_text: str, joint_previous: bool):
         edit: TransTextEdit = self.sender()
-        blk_item = self.textblk_item_list[edit.idx]
+        blk_item = self._safe_blk_item(getattr(edit, 'idx', -1))
+        if blk_item is None:
+            return
         if blk_item.isEditing():
             blk_item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         propagate_user_edit(edit, blk_item, pos, added_text, joint_previous)
@@ -1267,7 +1438,11 @@ class SceneTextManager(QObject):
         selected_blks = self.canvas.selected_text_items()
         trans_widget_list = []
         for blk in selected_blks:
-            trans_widget_list.append(self.pairwidget_list[blk.idx].e_trans)
+            pw = self._safe_pair_widget(getattr(blk, 'idx', -1))
+            # Skip silently rather than crashing on a stale-indexed selection.
+            if pw is None:
+                continue
+            trans_widget_list.append(pw.e_trans)
         if len(selected_blks) > 0:
             self.canvas.push_undo_command(ApplyFontformatCommand(selected_blks, trans_widget_list, fontformat))
             if self.formatpanel.global_mode():
@@ -1287,7 +1462,12 @@ class SceneTextManager(QObject):
             else:
                 selset.pop(blkitem.idx)
         for idx in selset:
-            self.textblk_item_list[idx].setSelected(True)
+            # Guard: pw idx in checked_list can outlive a page rebuild for one
+            # paint cycle. Skip rather than IndexError -- the next selection
+            # event reconciles state.
+            blk = self._safe_blk_item(idx)
+            if blk is not None:
+                blk.setSelected(True)
         self.canvas.block_selection_signal = False
 
     def on_textedit_list_focusout(self):
@@ -1307,6 +1487,10 @@ class SceneTextManager(QObject):
                 continue
             blk_item.idx = ii
             self.pairwidget_list[ii].updateIndex(ii)
+            # Keep the floating badge label in sync after every renumber. The
+            # badge owns its own number cache so we refresh explicitly.
+            if getattr(blk_item, 'number_badge', None) is not None:
+                blk_item.number_badge.set_idx(ii)
         cl = self.textEditList.checked_list
         if len(cl) != 0:
             cl.sort(key=lambda x: x.idx)
@@ -1351,8 +1535,14 @@ class SceneTextManager(QObject):
     def on_ensure_textitem_svisible(self):
         edit: Union[TransTextEdit, SourceTextEdit] = self.sender()
         self.changeHoveringWidget(edit)
-        self.canvas.gv.ensureVisible(self.textblk_item_list[edit.idx])
-        self.txtblkShapeControl.setBlkItem(self.textblk_item_list[edit.idx])
+        # Guard the lookup: signal can fire from a soon-to-be-pooled edit
+        # whose .idx is stale during page swap. _safe_blk_item returns None
+        # for out-of-range indices instead of raising IndexError.
+        blk_item = self._safe_blk_item(getattr(edit, 'idx', -1))
+        if blk_item is None:
+            return
+        self.canvas.gv.ensureVisible(blk_item)
+        self.txtblkShapeControl.setBlkItem(blk_item)
 
     def onApplyFontToAllPages(self):
         fmt = self.formatpanel.global_format.deepcopy()
@@ -1372,6 +1562,406 @@ class SceneTextManager(QObject):
 
     def on_page_replace_all(self):
         self.canvas.push_undo_command(PageReplaceAllCommand(self.canvas.search_widget))
+
+    # --- Number badge: visibility toggle, click-to-select, drag-to-reorder ---
+
+    def set_numbers_visible(self, visible: bool):
+        # Toggle every live block's badge. Pooled items are picked up via
+        # addTextBlock when they re-enter the scene, so we only walk the live list.
+        for blk_item in self.textblk_item_list:
+            badge = getattr(blk_item, 'number_badge', None)
+            if badge is not None:
+                badge.setVisible(visible)
+
+    def onBadgeClicked(self, idx: int):
+        # Single-click on a badge: select that block and surface it in the
+        # right-side translation panel. Mimics the click flow of selecting via
+        # the canvas item itself but skips edit-mode entry.
+        if idx < 0 or idx >= len(self.textblk_item_list):
+            return
+        blk_item = self.textblk_item_list[idx]
+        self.canvas.block_selection_signal = True
+        self.canvas.clearSelection()
+        blk_item.setSelected(True)
+        self.canvas.block_selection_signal = False
+        self.txtblkShapeControl.setBlkItem(blk_item)
+        if 0 <= idx < len(self.pairwidget_list):
+            self.changeHoveringWidget(self.pairwidget_list[idx].e_trans)
+            self.textEditList.set_selected_list([idx])
+        self.canvas.gv.ensureVisible(blk_item)
+        # Sync formatpanel + scene state since we suppressed selection signal.
+        self.on_incanvas_selection_changed()
+
+    def _badge_at_scene_pos(self, scene_pos: QPointF):
+        # Find the topmost badge under the cursor. ItemIgnoresTransformations
+        # invalidates plain mapToScene-based hit tests (the badge's scene
+        # bounding rect is in untransformed local size, not the painted screen
+        # size), so we route the test through QGraphicsView.items(viewport_pos)
+        # which handles the flag correctly.
+        from .textblock_badge import TextBlockNumberBadge  # local: avoid cyclic import at module load
+        gv = self.canvas.gv
+        viewport_pt = gv.mapFromScene(scene_pos)
+        for it in gv.items(viewport_pt):
+            if isinstance(it, TextBlockNumberBadge) and it.isVisible():
+                return it.idx
+        return None
+
+    def onBadgeDragStarted(self, src_idx: int):
+        # Begin a drag-reorder gesture. Manager owns target tracking so the
+        # dragged badge does not need to know about siblings.
+        self._badge_drag_src = src_idx
+        self._badge_drag_target = None
+        if 0 <= src_idx < len(self.textblk_item_list):
+            badge = self.textblk_item_list[src_idx].number_badge
+            if badge is not None:
+                badge.set_highlight(2)
+
+    def onBadgeDragging(self, scene_pos: QPointF):
+        if getattr(self, '_badge_drag_src', None) is None:
+            return
+        new_target = self._badge_at_scene_pos(scene_pos)
+        # Do not treat hovering the source badge as a drop target -- a drop on
+        # the same idx is a no-op and the highlight would otherwise flash.
+        if new_target == self._badge_drag_src:
+            new_target = None
+        prev = self._badge_drag_target
+        if prev != new_target:
+            if prev is not None and 0 <= prev < len(self.textblk_item_list):
+                old_badge = self.textblk_item_list[prev].number_badge
+                if old_badge is not None:
+                    old_badge.set_highlight(0)
+            self._badge_drag_target = new_target
+            if new_target is not None and 0 <= new_target < len(self.textblk_item_list):
+                new_badge = self.textblk_item_list[new_target].number_badge
+                if new_badge is not None:
+                    new_badge.set_highlight(1)
+
+    def onBadgeDragEnded(self, scene_pos: QPointF):
+        src = getattr(self, '_badge_drag_src', None)
+        tgt = getattr(self, '_badge_drag_target', None)
+        # Reset all visual state regardless of outcome.
+        if src is not None and 0 <= src < len(self.textblk_item_list):
+            badge = self.textblk_item_list[src].number_badge
+            if badge is not None:
+                badge.set_highlight(0)
+        if tgt is not None and 0 <= tgt < len(self.textblk_item_list):
+            badge = self.textblk_item_list[tgt].number_badge
+            if badge is not None:
+                badge.set_highlight(0)
+        self._badge_drag_src = None
+        self._badge_drag_target = None
+        if src is None or tgt is None or src == tgt:
+            return
+        self._reorder_block_to_position(src, tgt)
+
+    def cancel_badge_drag(self):
+        # ESC handler / page-change handler. Wipe drag state without reordering.
+        # Safe to call when no drag is active (e.g. ESC pressed outside any
+        # badge press, or clearSceneTextitems on first page load).
+        #
+        # Bug fixes hardened here (M1, M2, L9):
+        #   * M1/L9: previously we only cleared the highlight border. The badge
+        #     itself still held _dragging=True, _press_scene_pos and a
+        #     ClosedHand cursor. After ESC the cursor stayed stuck and a
+        #     subsequent click on the same badge re-entered drag mode without
+        #     a fresh press. badge.cancel() now resets _dragging,
+        #     _press_scene_pos, the cursor, and releases any pending mouse
+        #     grab.
+        #   * M2: when the page changes mid-drag, _pool_release_blk_item hides
+        #     and removes the source badge from the scene. If the scene mouse
+        #     grab was still on that badge, the eventual mouseRelease event
+        #     would route to a detached item -> AttributeError. We now call
+        #     badge.cancel() (which calls ungrabMouse()) BEFORE pool release
+        #     happens. Note: clearSceneTextitems() calls cancel_badge_drag()
+        #     before the pool release loop, so as long as we ungrab here the
+        #     subsequent pool release is safe.
+        src = getattr(self, '_badge_drag_src', None)
+        tgt = getattr(self, '_badge_drag_target', None)
+        if src is not None and 0 <= src < len(self.textblk_item_list):
+            b = self.textblk_item_list[src].number_badge
+            if b is not None:
+                # cancel() resets cursor + drag flags + ungrabs mouse, in
+                # addition to clearing the highlight.
+                b.cancel()
+        if tgt is not None and 0 <= tgt < len(self.textblk_item_list):
+            b = self.textblk_item_list[tgt].number_badge
+            if b is not None:
+                b.set_highlight(0)
+        self._badge_drag_src = None
+        self._badge_drag_target = None
+        # Also dismiss any open quick-reorder popup. ESC during drag should
+        # leave nothing floating either.
+        self._dismiss_quick_reorder_popup()
+
+    def _reorder_block_to_position(self, src_idx: int, target_idx: int):
+        # "Insert before target" semantics: removing src first shifts indices.
+        # We translate that into the (src_ids, tgt_ids) tuple format that
+        # RearrangeBlksCommand already supports for the textEditList drag flow.
+        n = len(self.textblk_item_list)
+        if n < 2 or not (0 <= src_idx < n) or not (0 <= target_idx < n):
+            return
+        if src_idx == target_idx:
+            return
+        order = list(range(n))
+        moved = order.pop(src_idx)
+        # If the source was before the target, popping shifts the target left
+        # by 1. Insert-before becomes insert at the new (shifted) target index.
+        if src_idx < target_idx:
+            insert_pos = target_idx - 1
+        else:
+            insert_pos = target_idx
+        order.insert(insert_pos, moved)
+        ids_ori, ids_tgt = [], []
+        for new_pos, old_pos in enumerate(order):
+            if new_pos != old_pos:
+                ids_ori.append(old_pos)
+                ids_tgt.append(new_pos)
+        if not ids_ori:
+            return
+        self.canvas.push_undo_command(RearrangeBlksCommand((ids_ori, ids_tgt), self))
+
+    def move_block_to_position(self, src_idx: int, target_idx: int):
+        # END-POSITION semantics: target_idx is the desired FINAL 0-based index
+        # of the moved block. Used by Ctrl+J popup, context menu, and any
+        # programmatic mover where the user thinks in terms of "where should
+        # this block end up" (e.g. typing "8" must put the block at slot 8).
+        #
+        # Drag-and-drop uses the separate insert-before flow in
+        # _reorder_block_to_position, which keeps the standard "drop on
+        # target" UI metaphor and does not pass through this wrapper.
+        n = len(self.textblk_item_list)
+        if n < 2:
+            return
+        if not (0 <= src_idx < n):
+            return
+        if target_idx < 0:
+            target_idx = 0
+        elif target_idx >= n:
+            target_idx = n - 1
+        if src_idx == target_idx:
+            return
+        if getattr(self, '_badge_drag_src', None) is not None:
+            self.cancel_badge_drag()
+
+        order = list(range(n))
+        moved = order.pop(src_idx)
+        order.insert(target_idx, moved)
+        ids_ori, ids_tgt = [], []
+        for new_pos, old_pos in enumerate(order):
+            if new_pos != old_pos:
+                ids_ori.append(old_pos)
+                ids_tgt.append(new_pos)
+        if not ids_ori:
+            return
+        self.canvas.push_undo_command(RearrangeBlksCommand((ids_ori, ids_tgt), self))
+
+    def toggle_numbers_visible(self):
+        # Flip pcfg + push the new visibility through to all live badges.
+        # Mirrors MainWindow.shortcutToggleNumberBadge so badge-context-menu
+        # and the N hotkey converge on the same persisted state.
+        new_visible = not getattr(pcfg, 'show_textblock_number', True)
+        pcfg.show_textblock_number = new_visible
+        self.set_numbers_visible(new_visible)
+
+    def onCanvasReorderRequested(self, action: str):
+        # Right-click context menu on canvas dispatches reorder actions here.
+        # We resolve the target block from the current selection / shape
+        # control, then route to the same primitives the keyboard shortcuts
+        # use. action is one of: 'top', 'up', 'down', 'bottom', 'position',
+        # 'auto_sort'.
+        if action == 'auto_sort':
+            self.auto_sort_reading_order()
+            return
+        target_blk = None
+        sel = self.canvas.selected_text_items()
+        if sel:
+            target_blk = sel[0]
+        elif self.txtblkShapeControl.blk_item is not None:
+            target_blk = self.txtblkShapeControl.blk_item
+        if target_blk is None:
+            return
+        idx = getattr(target_blk, 'idx', None)
+        if idx is None:
+            return
+        n = len(self.textblk_item_list)
+        if n < 2:
+            return
+        if action == 'position':
+            self.open_quick_reorder_popup(idx)
+            return
+        if action == 'top':
+            self.move_block_to_position(idx, 0)
+        elif action == 'up':
+            self.move_block_to_position(idx, idx - 1)
+        elif action == 'down':
+            self.move_block_to_position(idx, idx + 1)
+        elif action == 'bottom':
+            self.move_block_to_position(idx, n - 1)
+
+    def open_quick_reorder_popup(self, badge_or_idx):
+        # Spawn the QuickReorderInputPopup anchored on the target badge. The
+        # popup is a child of the canvas viewport so it floats above the scene
+        # without participating in QGraphicsScene event flow.
+        #
+        # badge_or_idx accepts either:
+        #   * int -- the block idx (0-based) -- used by Ctrl+J and the badge
+        #     context menu's "Move to position..." action (which emits its
+        #     own idx).
+        #   * TextBlockNumberBadge -- direct reference; we read .idx from it.
+        # The dual signature keeps callers compact.
+        if shared.HEADLESS:
+            return
+        if not self.canvas.textEditMode():
+            return
+        from .textblock_badge import TextBlockNumberBadge, QuickReorderInputPopup, QUICK_REORDER_W, QUICK_REORDER_H
+
+        if isinstance(badge_or_idx, TextBlockNumberBadge):
+            idx = badge_or_idx.idx
+        else:
+            try:
+                idx = int(badge_or_idx)
+            except (TypeError, ValueError):
+                return
+        n = len(self.textblk_item_list)
+        if n == 0 or not (0 <= idx < n):
+            return
+        blk_item = self.textblk_item_list[idx]
+        badge = getattr(blk_item, 'number_badge', None)
+        if badge is None:
+            return
+
+        # Tear down any prior popup so we don't accumulate floating widgets if
+        # the user fires Ctrl+J twice in a row.
+        self._dismiss_quick_reorder_popup()
+
+        gv = self.canvas.gv
+        viewport = gv.viewport()
+        if viewport is None:
+            return
+
+        # Anchor the popup at the badge's screen position. The badge sits in
+        # scene coords on the parent block; mapping through the badge's
+        # parentItem -> scene -> viewport keeps the popup glued to whatever
+        # the user can see, even under zoom/pan.
+        parent_item = badge.parentItem()
+        badge_local_pos = badge.pos()
+        if parent_item is not None:
+            badge_scene_pos = parent_item.mapToScene(badge_local_pos)
+        else:
+            badge_scene_pos = badge_local_pos
+        viewport_pt = gv.mapFromScene(badge_scene_pos)
+
+        popup = QuickReorderInputPopup(viewport, idx, n)
+        # Nudge the popup so it sits just below-right of the badge rather than
+        # directly on top of it (the user still wants to see which block is
+        # being moved). 12px down clears the badge's ~18px height from the
+        # anchor point and the popup itself is 28px tall.
+        x = viewport_pt.x()
+        y = viewport_pt.y() + 12
+        # Clamp inside the viewport so the popup never spawns offscreen when
+        # the badge is near the canvas edge.
+        max_x = max(0, viewport.width() - QUICK_REORDER_W)
+        max_y = max(0, viewport.height() - QUICK_REORDER_H)
+        x = max(0, min(x, max_x))
+        y = max(0, min(y, max_y))
+        popup.move(x, y)
+
+        popup.submitted.connect(self._on_quick_reorder_submitted)
+        popup.cancelled.connect(self._dismiss_quick_reorder_popup)
+        self._quick_reorder_popup = popup
+        self._quick_reorder_src_idx = idx
+        popup.show()
+        popup.raise_()
+        popup.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_quick_reorder_submitted(self, target_0based: int):
+        # Called from QuickReorderInputPopup.submitted. Drives the move via
+        # the public mover so bounds checks run uniformly.
+        src = getattr(self, '_quick_reorder_src_idx', None)
+        # Tear down the popup first so move_block_to_position's eventual
+        # selection updates don't fight with focus on a doomed widget.
+        self._dismiss_quick_reorder_popup()
+        if src is None:
+            return
+        self.move_block_to_position(src, target_0based)
+
+    def _dismiss_quick_reorder_popup(self):
+        # Idempotent close. Called from cancel paths and after a successful
+        # submit. Safe to call when no popup exists.
+        popup = getattr(self, '_quick_reorder_popup', None)
+        if popup is not None:
+            try:
+                popup.blockSignals(True)
+                popup.hide()
+                popup.deleteLater()
+            except Exception:
+                pass
+        self._quick_reorder_popup = None
+        self._quick_reorder_src_idx = None
+
+    def auto_sort_reading_order(self):
+        # Build the desired permutation and feed it into the existing
+        # RearrangeBlksCommand for an undoable, panel-syncing reorder. No-op
+        # when there's nothing to sort.
+        # Cancel any in-progress badge drag and dismiss any open quick-reorder
+        # popup first: the indices about to change underneath them would
+        # otherwise leave stale highlights / a stale src idx on the popup.
+        self.cancel_badge_drag()
+        n = len(self.textblk_item_list)
+        if n < 2:
+            return
+        new_order = self._compute_reading_order(self.textblk_item_list)
+        if new_order == list(range(n)):
+            return
+        ids_ori, ids_tgt = [], []
+        for new_pos, old_pos in enumerate(new_order):
+            if new_pos != old_pos:
+                ids_ori.append(old_pos)
+                ids_tgt.append(new_pos)
+        if not ids_ori:
+            return
+        self.canvas.push_undo_command(RearrangeBlksCommand((ids_ori, ids_tgt), self))
+
+    def _compute_reading_order(self, blk_list):
+        # Manhwa convention: top-to-bottom primary, left-to-right within rows.
+        # Two-pass approach:
+        #   1. Sort by center-y to establish vertical ordering.
+        #   2. Within rows (defined by overlap on the y axis with tolerance ~30%
+        #      of the average block height), break ties by center-x.
+        # This is robust to slightly misaligned blocks where naive cy sorting
+        # would otherwise order side-by-side bubbles by a tiny y offset.
+        n = len(blk_list)
+        if n == 0:
+            return []
+        rects = []
+        for blk_item in blk_list:
+            br = blk_item.absBoundingRect(qrect=True)
+            cx = br.x() + br.width() / 2.0
+            cy = br.y() + br.height() / 2.0
+            rects.append((cx, cy, br.height()))
+        avg_h = sum(r[2] for r in rects) / max(1, n)
+        # 30% of avg height tolerance: blocks closer than this on cy are
+        # considered same-row and sorted L-to-R.
+        tol = max(avg_h * 0.3, 1.0)
+        # First pass: stable sort by cy ascending.
+        order = sorted(range(n), key=lambda i: rects[i][1])
+        # Second pass: walk groups whose cy fall within tolerance and resort
+        # them by cx. We expand the group as long as the next item's cy is
+        # within tol of the *first* item in the group (not the running median),
+        # which keeps the grouping deterministic.
+        result = []
+        i = 0
+        while i < n:
+            j = i + 1
+            base_cy = rects[order[i]][1]
+            while j < n and abs(rects[order[j]][1] - base_cy) <= tol:
+                j += 1
+            group = order[i:j]
+            group.sort(key=lambda idx: rects[idx][0])
+            result.extend(group)
+            i = j
+        return result
+
 
 def get_text_size(fm: QFontMetricsF, text: str) -> Tuple[int, int]:
     brt = fm.tightBoundingRect(text)

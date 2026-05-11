@@ -8,8 +8,14 @@ import subprocess
 import json
 import hashlib
 import time
+import faulthandler
 from platform import platform
 from pathlib import Path
+
+# Dump native stack trace on segfault / abort / Qt assertion failure.
+# Without this, Qt C++ crashes exit silently with no Python traceback,
+# making "process just disappeared" bugs impossible to diagnose.
+faulthandler.enable()
 
 BRANCH = 'dev'
 VERSION = '1.4.0'

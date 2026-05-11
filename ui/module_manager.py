@@ -196,6 +196,16 @@ class TranslateThread(ModuleThread):
             cfg_module.translate_source = self.translator.lang_source
             cfg_module.translate_target = self.translator.lang_target
             cfg_module.translator = self.translator.name
+            # Mirror _set_module: release the previous translator's GPU/CPU buffers
+            # so swapping translators doesn't accumulate VRAM/RAM.
+            if old_translator is not None and old_translator is not self.translator:
+                try:
+                    if hasattr(old_translator, 'unload_model'):
+                        old_translator.unload_model()
+                except Exception:
+                    pass
+                del old_translator
+                soft_empty_cache()
         except Exception as e:
             if old_translator is None:
                 old_translator = TRANSLATORS.module_dict['google']('简体中文', 'English', raise_unsupported_lang=False)

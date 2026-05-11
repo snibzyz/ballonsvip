@@ -8,8 +8,8 @@ import time
 import cv2
 
 from tqdm import tqdm
-from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit, QProgressDialog
-from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal
+from qtpy.QtWidgets import QAction, QFileDialog, QMenu, QHBoxLayout, QVBoxLayout, QApplication, QStackedWidget, QSplitter, QListWidget, QShortcut, QListWidgetItem, QMessageBox, QTextEdit, QPlainTextEdit, QProgressDialog, QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QAbstractSpinBox
+from qtpy.QtCore import Qt, QPoint, QSize, QEvent, Signal, QTimer
 from qtpy.QtGui import QContextMenuEvent, QTextCursor, QGuiApplication, QIcon, QCloseEvent, QKeySequence, QKeyEvent, QPainter, QClipboard, QImage, QShowEvent, QFocusEvent
 
 from utils.logger import logger as LOGGER
@@ -106,6 +106,21 @@ class MainWindow(mainwindow_cls):
         self.setupConfig()
         self.setupShortcuts()
         self.setupRegisterWidget()
+
+        # Global key event filter for layout-independent shortcut dispatch.
+        # Qt's QShortcut matches by produced character: on a Thai (Kedmanee)
+        # layout the physical A key emits "ฟ", so the registered "A" shortcut
+        # never fires. The existing per-shortcut Thai variants help for plain
+        # base characters but not for combining marks (Ctrl+J -> Ctrl+่), and
+        # the keyPressEvent fallback only runs when the event actually reaches
+        # MainWindow -- which doesn't happen when the QGraphicsView (or any
+        # focused child widget) consumes the key first.
+        #
+        # An application-level filter sees every QKeyEvent BEFORE Qt's normal
+        # shortcut dispatch and widget routing, so we can match on
+        # nativeVirtualKey() (the Windows VK_* code, identical across every
+        # layout) and consume the event before it ever needs to bubble.
+        self.app.installEventFilter(self)
         # self.showMaximized()
         FramelessMoveResize.toggleMaxState(self)
         self.setAcceptDrops(True)
@@ -654,25 +669,16 @@ class MainWindow(mainwindow_cls):
     def showEvent(self, event: QShowEvent) -> None:
         """Auto-select canvas when window is shown"""
         super().showEvent(event)
-        # ALWAYS restore canvas focus when window is shown
-        # This ensures keyboard shortcuts work immediately when the app is opened
-        from qtpy.QtCore import QTimer
-        def restore_canvas_focus_on_show():
-            if hasattr(self, 'canvas') and not self.canvas.gv.hasFocus():
-                self.activateWindow()
-                QApplication.setActiveWindow(self)
-                self.canvas.gv.setFocus()
-        QTimer.singleShot(100, restore_canvas_focus_on_show)
-        
-        # Auto-select canvas when window is shown - use QTimer to ensure it works
+        # Multi-stage focus restore on first show / unminimize. Each retry uses
+        # the shared idle check so a real text editor is never robbed.
         if hasattr(self, 'canvas'):
-            from qtpy.QtCore import QTimer
-            def delayed_focus():
-                # Activate window first, then set focus
+            def activate_and_restore():
                 self.activateWindow()
                 QApplication.setActiveWindow(self)
-                self.canvas.gv.setFocus()
-            QTimer.singleShot(200, delayed_focus)  # Increase delay to 200ms
+                self._restore_canvas_focus_if_idle()
+            QTimer.singleShot(0, activate_and_restore)
+            QTimer.singleShot(100, activate_and_restore)
+            QTimer.singleShot(200, activate_and_restore)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         # Check if there are unsaved changes
@@ -716,6 +722,76 @@ class MainWindow(mainwindow_cls):
         self.save_config()
         return super().closeEvent(event)
 
+    def _focus_widget_is_text_input(self, focus_widget):
+        # Whitelist of widgets where keystrokes mean "user is typing", so the
+        # focus-restore path must not steal focus from them.
+        # Editable QComboBox / spinbox in edit mode delegate the keyboard to an
+        # internal QLineEdit, so the QLineEdit branch handles them. We also
+        # match the popup widget directly since editable=False combos still
+        # absorb arrow keys when popped.
+        from .textedit_area import SourceTextEdit, TransTextEdit
+        from .textblock_badge import QuickReorderInputPopup
+        if focus_widget is None:
+            return False
+        if isinstance(focus_widget, (SourceTextEdit, TransTextEdit, QuickReorderInputPopup)):
+            return True
+        if isinstance(focus_widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            # Only treat as "user typing" when the field is actually editable.
+            # ReadOnly QLineEdit/QTextEdit (e.g. result viewers) shouldn't trap
+            # the canvas shortcuts.
+            try:
+                if focus_widget.isReadOnly():
+                    return False
+            except Exception:
+                pass
+            return True
+        if isinstance(focus_widget, QAbstractSpinBox):
+            try:
+                if focus_widget.isReadOnly():
+                    return False
+            except Exception:
+                pass
+            return True
+        if isinstance(focus_widget, QComboBox):
+            # Editable combobox => user is typing in its line edit. Non-editable
+            # combos navigate by arrow keys but don't conflict with our A/D/W/N
+            # shortcuts (they trigger only as bare letters), so we leave focus
+            # alone only when a popup is visible.
+            try:
+                if focus_widget.isEditable():
+                    return True
+                if focus_widget.view() is not None and focus_widget.view().isVisible():
+                    return True
+            except Exception:
+                pass
+            return False
+        return False
+
+    def _restore_canvas_focus_if_idle(self):
+        # Move focus back to the graphics view unless the user is actively
+        # typing. Cheap to call repeatedly: returns early when focus is already
+        # correct or when a real text input owns it.
+        # Wrapped in try/except because deferred timers can fire after a child
+        # widget has been Qt-deleted during a page rebuild (RuntimeError:
+        # "wrapped C/C++ object has been deleted"). A silent skip is the right
+        # behaviour: focus will settle naturally on the next user interaction.
+        try:
+            if not hasattr(self, 'canvas') or self.canvas is None:
+                return
+            gv = getattr(self.canvas, 'gv', None)
+            if gv is None:
+                return
+            focus_widget = QApplication.focusWidget()
+            if self._focus_widget_is_text_input(focus_widget):
+                return
+            if gv.hasFocus():
+                return
+            gv.setFocus()
+        except RuntimeError:
+            return
+        except Exception:
+            return
+
     def changeEvent(self, event: QEvent):
         if event.type() == QEvent.Type.WindowStateChange:
             if self.windowState() & Qt.WindowState.WindowMaximized:
@@ -723,20 +799,183 @@ class MainWindow(mainwindow_cls):
                     self.titleBar.maxBtn.setChecked(True)
         elif event.type() == QEvent.Type.ActivationChange:
             self.canvas.on_activation_changed()
-            # Restore canvas focus when window is activated
+            # Restore canvas focus when window is activated. Windows delays the
+            # final focus settle after Alt+Tab / taskbar click, and the timing
+            # varies by compositor state, so we kick off three retries at 0ms,
+            # 50ms, and 200ms instead of relying on a single 50ms shot. Each
+            # retry self-checks against _focus_widget_is_text_input so a real
+            # text editor never gets robbed.
             if self.isActiveWindow():
-                from qtpy.QtCore import QTimer
-                def restore_focus():
-                    # Only restore if no text editor has focus
-                    focus_widget = QApplication.focusWidget()
-                    from .textedit_area import SourceTextEdit, TransTextEdit
-                    if not isinstance(focus_widget, (SourceTextEdit, TransTextEdit)):
-                        if not self.canvas.gv.hasFocus():
-                            self.canvas.gv.setFocus()
-                QTimer.singleShot(50, restore_focus)
+                self._restore_canvas_focus_if_idle()
+                QTimer.singleShot(0, self._restore_canvas_focus_if_idle)
+                QTimer.singleShot(50, self._restore_canvas_focus_if_idle)
+                QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
 
         super().changeEvent(event)
-    
+
+    # focusInEvent override removed: ActivationChange in changeEvent already
+    # covers Alt-Tab / taskbar return cases via the multi-stage timer, and the
+    # extra focusInEvent path was firing during programmatic widget rebuilds
+    # (page change, pool reuse) which races with Qt-internal focus dispatch
+    # and can crash the renderer on Windows.
+
+    def eventFilter(self, obj, event):
+        # Installed on QApplication: catches every QKeyEvent before Qt's
+        # shortcut dispatch and widget routing. We use this exclusively to
+        # turn nativeVirtualKey() into a shortcut, which keeps every binding
+        # working on any keyboard layout (Thai, Russian, ...). All other
+        # events fall through to default handling.
+        try:
+            if event.type() == QEvent.Type.KeyPress:
+                if self._dispatch_shortcut_by_vk(event):
+                    return True
+        except Exception:
+            # Never let a filter fault break global event flow.
+            pass
+        return super().eventFilter(obj, event)
+
+    def _dispatch_shortcut_by_vk(self, event) -> bool:
+        # Mirror of the existing nativeVirtualKey table in keyPressEvent, but
+        # invoked from the QApplication-level eventFilter so the dispatch
+        # happens regardless of which widget is focused. Returns True when
+        # the event has been consumed.
+        fw = QApplication.focusWidget()
+        if self._focus_widget_is_text_input(fw):
+            return False
+
+        vk = event.nativeVirtualKey()
+        if vk == 0:
+            return False
+
+        mods = event.modifiers()
+        no_mod = (mods == Qt.KeyboardModifier.NoModifier)
+        ctrl_only = (mods == Qt.KeyboardModifier.ControlModifier)
+        ctrl_shift = (mods == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
+        alt_only = (mods == Qt.KeyboardModifier.AltModifier)
+
+        if no_mod:
+            if vk == 0x41:    # A -> previous page
+                self.shortcutBefore(); return True
+            if vk == 0x44:    # D -> next page
+                self.shortcutNext(); return True
+            if vk == 0x57:    # W -> toggle textblock outline
+                self.shortcutTextblock(); return True
+            if vk == 0x4E:    # N -> toggle number badges
+                self.shortcutToggleNumberBadge(); return True
+            if vk == 0xDB:    # [ -> brush size minus
+                self.drawingPanel.on_decre_pensize(); return True
+            if vk == 0xDD:    # ] -> brush size plus
+                self.drawingPanel.on_incre_pensize(); return True
+            if vk == 0x50:    # P -> toggle drawing board
+                self.shortcutDrawboard(); return True
+            if vk == 0x54:    # T -> toggle text editor
+                self.shortcutTextedit(); return True
+            # Drawing-tool selectors. These have Thai QShortcuts registered,
+            # but the Thai variants are combining marks for J/H/B which Qt
+            # cannot parse into valid QKeySequences, so dispatch by VK too.
+            if vk == 0x48:    # H -> hand tool
+                self.drawingPanel.shortcutSetCurrentToolByName('hand'); return True
+            if vk == 0x52:    # R -> rect tool
+                self.drawingPanel.shortcutSetCurrentToolByName('rect'); return True
+            if vk == 0x4A:    # J -> inpaint tool
+                self.drawingPanel.shortcutSetCurrentToolByName('inpaint'); return True
+            if vk == 0x42:    # B -> pen tool
+                self.drawingPanel.shortcutSetCurrentToolByName('pen'); return True
+
+        if ctrl_only:
+            if vk == 0x4A:    # Ctrl+J -> quick reorder popup
+                self.shortcutQuickReorder(); return True
+            if vk == 0x45:    # Ctrl+E -> OCR
+                self.shortcutOCR(); return True
+            if vk == 0x44:    # Ctrl+D -> delete current selection
+                self.shortcutCtrlD(); return True
+
+        if ctrl_shift:
+            if vk == 0x52:    # Ctrl+Shift+R -> auto-sort reading order
+                self.shortcutAutoSortReadingOrder(); return True
+
+        if alt_only:
+            if vk == 0x26:    # VK_UP
+                self.shortcutMoveBlockUp(); return True
+            if vk == 0x28:    # VK_DOWN
+                self.shortcutMoveBlockDown(); return True
+            if vk == 0x24:    # VK_HOME
+                self.shortcutMoveBlockTop(); return True
+            if vk == 0x23:    # VK_END
+                self.shortcutMoveBlockBottom(); return True
+
+        return False
+
+    def keyPressEvent(self, event):
+        # Layout-independent shortcut fallback. Qt's QShortcut("P") matches
+        # the character output of the active keyboard layout; on Thai layouts
+        # (Kedmanee, Pattachote, ...) physical P emits "ย"/"ัน"/etc., so the
+        # registered Latin shortcut never fires and the user has to flip IME
+        # state for every keypress. Routing by event.nativeVirtualKey() (the
+        # Windows VK_* code, identical across every Latin/Thai/CJK layout)
+        # keeps shortcuts working regardless of input language. We only run
+        # this fallback when the event reaches the main window unhandled --
+        # i.e. no QShortcut/QAction matched and no focused text editor
+        # consumed it -- so an English keyboard still hits the existing
+        # QShortcut path with no behaviour change.
+        try:
+            fw = QApplication.focusWidget()
+            if self._focus_widget_is_text_input(fw):
+                return super().keyPressEvent(event)
+
+            vk = event.nativeVirtualKey()
+            mods = event.modifiers()
+            no_mod = (mods == Qt.KeyboardModifier.NoModifier)
+            ctrl_only = (mods == Qt.KeyboardModifier.ControlModifier)
+            ctrl_shift = (mods == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
+            alt_only = (mods == Qt.KeyboardModifier.AltModifier)
+
+            # Plain letter / symbol shortcuts.
+            if no_mod:
+                if vk == 0x41:    # A -> previous page
+                    self.shortcutBefore(); event.accept(); return
+                if vk == 0x44:    # D -> next page
+                    self.shortcutNext(); event.accept(); return
+                if vk == 0x57:    # W -> toggle textblock outline
+                    self.shortcutTextblock(); event.accept(); return
+                if vk == 0x4E:    # N -> toggle number badges
+                    self.shortcutToggleNumberBadge(); event.accept(); return
+                if vk == 0xDB:    # [ -> brush size minus
+                    self.drawingPanel.on_decre_pensize(); event.accept(); return
+                if vk == 0xDD:    # ] -> brush size plus
+                    self.drawingPanel.on_incre_pensize(); event.accept(); return
+                if vk == 0x50:    # P -> toggle drawing board
+                    self.shortcutDrawboard(); event.accept(); return
+                if vk == 0x54:    # T -> toggle text editor
+                    self.shortcutTextedit(); event.accept(); return
+
+            # Ctrl chords.
+            if ctrl_only:
+                if vk == 0x4A:    # Ctrl+J -> quick reorder popup
+                    self.shortcutQuickReorder(); event.accept(); return
+                if vk == 0x45:    # Ctrl+E -> OCR
+                    self.shortcutOCR(); event.accept(); return
+
+            # Ctrl+Shift chords.
+            if ctrl_shift:
+                if vk == 0x52:    # Ctrl+Shift+R -> auto-sort
+                    self.shortcutAutoSortReadingOrder(); event.accept(); return
+
+            # Alt + arrow / home / end -> reorder shortcuts.
+            if alt_only:
+                if vk == 0x26:    # VK_UP
+                    self.shortcutMoveBlockUp(); event.accept(); return
+                if vk == 0x28:    # VK_DOWN
+                    self.shortcutMoveBlockDown(); event.accept(); return
+                if vk == 0x24:    # VK_HOME
+                    self.shortcutMoveBlockTop(); event.accept(); return
+                if vk == 0x23:    # VK_END
+                    self.shortcutMoveBlockBottom(); event.accept(); return
+        except Exception:
+            # Defensive: never let a fallback fault block normal keyPress flow.
+            pass
+        return super().keyPressEvent(event)
+
     def retranslateUI(self):
         # according to https://stackoverflow.com/questions/27635068/how-to-retranslate-dynamically-created-widgets
         # we got to do it manually ... I'd rather restart the program
@@ -776,12 +1015,10 @@ class MainWindow(mainwindow_cls):
             # Restore text block mode after updating scene items
             if self.bottomBar.textblockChecker.isChecked() or pcfg.imgtrans_textblock:
                 self.setTextBlockMode()
-            # Restore canvas focus after page change
-            from qtpy.QtCore import QTimer
-            def restore_canvas_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(100, restore_canvas_focus)
+            # Restore canvas focus after page change. Idle-checked so it does
+            # not yank focus out of a text editor on programmatic page changes
+            # (e.g. global search jump while typing in the search bar).
+            QTimer.singleShot(100, self._restore_canvas_focus_if_idle)
             self.titleBar.setTitleContent(page_name=self.imgtrans_proj.current_img)
             self.module_manager.handle_page_changed()
             self.drawingPanel.handle_page_changed()
@@ -789,7 +1026,7 @@ class MainWindow(mainwindow_cls):
         self.page_changing = False
 
     def setupShortcuts(self):
-        self.titleBar.nextpage_trigger.connect(self.shortcutNext) 
+        self.titleBar.nextpage_trigger.connect(self.shortcutNext)
         self.titleBar.prevpage_trigger.connect(self.shortcutBefore)
         self.titleBar.textedit_trigger.connect(self.shortcutTextedit)
         self.titleBar.drawboard_trigger.connect(self.shortcutDrawboard)
@@ -809,24 +1046,90 @@ class MainWindow(mainwindow_cls):
         self.titleBar.darkmode_trigger.connect(self.on_darkmode_triggered)
         self.titleBar.merge_tool_trigger.connect(self.on_open_merge_tool)
 
-        shortcutA = QShortcut(QKeySequence("A"), self)
-        shortcutA.activated.connect(self.shortcutBefore)
+        # Thai-keyboard fallback table. Qt's QShortcut("A") matches by produced
+        # character, not the physical key; on a Thai (Kedmanee) layout the same
+        # physical keys produce different characters and the English bindings
+        # never fire while Thai input is active. Registering parallel shortcuts
+        # for the Thai equivalents lets users operate the app without flipping
+        # IME state.
+        #
+        # Each physical English key gets BOTH the unshifted and the shifted
+        # Kedmanee variant where they differ -- some users hold shift purely
+        # to access symbols (e.g. '[' shifted) without realising the layout
+        # remap also moves the underlying character. We register every variant
+        # because handler bodies are idempotent and Qt deduplicates by sequence.
+        self._thai_keymap = {
+            'A': ['ฟ'],
+            'D': ['ก'],
+            'W': ['ไ'],
+            'N': ['ื'],
+            'H': ['้'],
+            'R': ['พ'],
+            'B': ['ิ'],
+            'J': ['่'],
+            '[': ['บ', 'ฃ'],        # unshifted then shifted Kedmanee
+            ']': ['ล', 'ฯ'],
+            'T': ['ะ'],
+            'P': ['ย'],
+            'E': ['ำ'],
+            'F': ['ด'],
+            'G': ['เ'],
+            'M': ['ท'],
+        }
+
+        # Helper: register one or more shortcut sequences against a single
+        # handler. Works for plain keys (T) and for chord keys (Ctrl+J,
+        # Ctrl+Shift+R). Qt routes activated() back through self.sender() in
+        # downstream handlers, so we attach .key() metadata via the sequence
+        # string -- not via a partial -- to keep signal introspection working.
+        def _register_shortcuts(sequences, handler):
+            for seq in sequences:
+                sc = QShortcut(QKeySequence(seq), self)
+                sc.activated.connect(handler)
+            return None
+
+        # Build (eng_key, [eng+thai sequences]) pairs once so all the Ctrl/Alt
+        # combos that include a letter automatically gain Thai equivalents too.
+        def _seqs_for(*english_keys):
+            # english_keys: a list of plain keys (e.g. 'A', 'Ctrl+J', 'Ctrl+Shift+R').
+            # For each, also emit the Thai-equivalent variants if a single
+            # letter or symbol is present in the chord. Returns the original
+            # list plus the Thai duplicates -- the original always comes first
+            # so English-keyboard users hit the same QShortcut path.
+            out = []
+            for eng in english_keys:
+                out.append(eng)
+                # Operate on the trailing chord token so we only swap the
+                # final key, not modifier names. e.g. "Ctrl+Shift+R" -> "R".
+                parts = eng.split('+')
+                tail = parts[-1]
+                lookup_key = tail.upper() if (len(tail) == 1 and tail.isalpha()) else tail
+                thai_variants = self._thai_keymap.get(lookup_key)
+                if not thai_variants:
+                    continue
+                prefix = parts[:-1]
+                for thai in thai_variants:
+                    if prefix:
+                        out.append('+'.join(prefix + [thai]))
+                    else:
+                        out.append(thai)
+            return out
+
+        _register_shortcuts(_seqs_for('A'), self.shortcutBefore)
         shortcutPageUp = QShortcut(QKeySequence(QKeySequence.StandardKey.MoveToPreviousPage), self)
         shortcutPageUp.activated.connect(self.shortcutBefore)
 
-        shortcutD = QShortcut(QKeySequence("D"), self)
-        shortcutD.activated.connect(self.shortcutNext)
+        _register_shortcuts(_seqs_for('D'), self.shortcutNext)
         shortcutPageDown = QShortcut(QKeySequence(QKeySequence.StandardKey.MoveToNextPage), self)
         shortcutPageDown.activated.connect(self.shortcutNext)
 
-        shortcutTextblock = QShortcut(QKeySequence("W"), self)
-        shortcutTextblock.activated.connect(self.shortcutTextblock)
+        _register_shortcuts(_seqs_for('W'), self.shortcutTextblock)
         shortcutZoomIn = QShortcut(QKeySequence.StandardKey.ZoomIn, self)
         shortcutZoomIn.activated.connect(self.canvas.gv.scale_up_signal)
         shortcutZoomOut = QShortcut(QKeySequence.StandardKey.ZoomOut, self)
         shortcutZoomOut.activated.connect(self.canvas.gv.scale_down_signal)
-        shortcutCtrlD = QShortcut(QKeySequence("Ctrl+D"), self)
-        shortcutCtrlD.activated.connect(self.shortcutCtrlD)
+        # Ctrl+D needs Thai variant: Ctrl+ก produced by physical D on Kedmanee.
+        _register_shortcuts(_seqs_for('Ctrl+D'), self.shortcutCtrlD)
         shortcutSpace = QShortcut(QKeySequence("Space"), self)
         shortcutSpace.activated.connect(self.shortcutSpace)
         shortcutSelectAll = QShortcut(QKeySequence.StandardKey.SelectAll, self)
@@ -847,24 +1150,62 @@ class MainWindow(mainwindow_cls):
 
         drawpanel_shortcuts = {'hand': 'H', 'rect': 'R', 'inpaint': 'J', 'pen': 'B'}
         for tool_name, shortcut_key in drawpanel_shortcuts.items():
-            shortcut = QShortcut(QKeySequence(shortcut_key), self)
-            shortcut.activated.connect(partial(self.drawingPanel.shortcutSetCurrentToolByName, tool_name))
+            for seq in _seqs_for(shortcut_key):
+                shortcut = QShortcut(QKeySequence(seq), self)
+                shortcut.activated.connect(partial(self.drawingPanel.shortcutSetCurrentToolByName, tool_name))
+            # Tooltip still shows English key (the canonical hint to users).
             self.drawingPanel.setShortcutTip(tool_name, shortcut_key)
 
-        shortcutDecrBrush = QShortcut(QKeySequence("["), self)
-        shortcutDecrBrush.activated.connect(self.drawingPanel.on_decre_pensize)
-        shortcutIncrBrush = QShortcut(QKeySequence("]"), self)
-        shortcutIncrBrush.activated.connect(self.drawingPanel.on_incre_pensize)
+        # Brush size: [ and ]. Thai equivalents from _thai_keymap.
+        _register_shortcuts(_seqs_for('['), self.drawingPanel.on_decre_pensize)
+        _register_shortcuts(_seqs_for(']'), self.drawingPanel.on_incre_pensize)
 
         # Ctrl+E for OCR
-        shortcutOCR = QShortcut(QKeySequence("Ctrl+E"), self)
-        shortcutOCR.activated.connect(self.shortcutOCR)
+        _register_shortcuts(_seqs_for('Ctrl+E'), self.shortcutOCR)
+
+        # N: toggle the floating per-block number badges on the canvas.
+        # Persisted in pcfg so the choice survives restart.
+        _register_shortcuts(_seqs_for('N'), self.shortcutToggleNumberBadge)
+
+        # Ctrl+Shift+R: auto-sort blocks by manhwa reading order (top-to-bottom,
+        # left-to-right within rows). Pushes a single undoable RearrangeBlksCommand.
+        _register_shortcuts(_seqs_for('Ctrl+Shift+R'), self.shortcutAutoSortReadingOrder)
+
+        # Ctrl+J: jump-to-position quick reorder. Spawns a small numeric input
+        # popup over the selected block's badge so the user can type a 1-based
+        # target position and press Enter. Replaces drag-precision pain when
+        # there are 30+ badges packed together.
+        # NOTE on key choice: Ctrl+G is already bound to global search
+        # (mainwindowbars.py:349). Ctrl+J ("jump") is unused and keeps the
+        # mnemonic.
+        _register_shortcuts(_seqs_for('Ctrl+J'), self.shortcutQuickReorder)
+
+        # Block reorder shortcuts mirror the right-click context menu:
+        # Alt+Up/Down nudge by one slot; Alt+Home/End jump to top/bottom.
+        # All require a selected block in text edit mode.
+        # Arrow keys / Home / End are layout-independent (their character output
+        # does not change on Thai keyboards), so no Thai fallback is needed.
+        shortcutMoveBlockUp = QShortcut(QKeySequence("Alt+Up"), self)
+        shortcutMoveBlockUp.activated.connect(self.shortcutMoveBlockUp)
+        shortcutMoveBlockDown = QShortcut(QKeySequence("Alt+Down"), self)
+        shortcutMoveBlockDown.activated.connect(self.shortcutMoveBlockDown)
+        shortcutMoveBlockTop = QShortcut(QKeySequence("Alt+Home"), self)
+        shortcutMoveBlockTop.activated.connect(self.shortcutMoveBlockTop)
+        shortcutMoveBlockBottom = QShortcut(QKeySequence("Alt+End"), self)
+        shortcutMoveBlockBottom.activated.connect(self.shortcutMoveBlockBottom)
 
     def shortcutNext(self):
-        
+
         sender: QShortcut = self.sender()
         if isinstance(sender, QShortcut):
-            if sender.key() == QKEY.Key_D:
+            # Bypass page-nav when editing a text block. The original check
+            # only matched the English D shortcut; the parallel Thai shortcut
+            # ('ก') would otherwise leak through and flip pages while the
+            # user typed. We compare the key sequence text instead so any
+            # bare-letter binding (English or Thai) is recognised.
+            seq_txt = sender.key().toString() if hasattr(sender.key(), 'toString') else ''
+            is_letter_only = len(seq_txt) == 1 and not seq_txt.isspace()
+            if sender.key() == QKEY.Key_D or is_letter_only:
                 if self.canvas.editing_textblkitem is not None:
                     return
         if self.centralStackWidget.currentIndex() == 0:
@@ -882,10 +1223,14 @@ class MainWindow(mainwindow_cls):
                     self.pageList.setCurrentRow(row)
 
     def shortcutBefore(self):
-        
+
         sender: QShortcut = self.sender()
         if isinstance(sender, QShortcut):
-            if sender.key() == QKEY.Key_A:
+            # Same rationale as shortcutNext: gate on "any single letter"
+            # shortcut so the Thai equivalent ('ฟ') also yields to text edit.
+            seq_txt = sender.key().toString() if hasattr(sender.key(), 'toString') else ''
+            is_letter_only = len(seq_txt) == 1 and not seq_txt.isspace()
+            if sender.key() == QKEY.Key_A or is_letter_only:
                 if self.canvas.editing_textblkitem is not None:
                     return
         if self.centralStackWidget.currentIndex() == 0:
@@ -1214,6 +1559,115 @@ class MainWindow(mainwindow_cls):
             self.canvas.search_widget.hide()
         elif self.canvas.editing_textblkitem is not None and self.canvas.editing_textblkitem.isEditing():
             self.canvas.editing_textblkitem.endEdit()
+        # Cancel any in-progress badge drag-reorder gesture. Cheap no-op if
+        # nothing is being dragged.
+        if hasattr(self, 'st_manager'):
+            self.st_manager.cancel_badge_drag()
+
+    def shortcutToggleNumberBadge(self):
+        # Skip when focus is on any text input (translation/source fields,
+        # search bars, font-family combobox, font-size spinbox, etc.) so
+        # typing the letter "n" never silently toggles badges. Uses the same
+        # exclusion list as the focus-restore path for consistency.
+        focus_widget = self.app.focusWidget()
+        if self._focus_widget_is_text_input(focus_widget):
+            return
+        # Only toggle while the canvas is the active page; on config/module pages
+        # the badges aren't visible anyway.
+        if self.centralStackWidget.currentIndex() != 0:
+            return
+        new_visible = not getattr(pcfg, 'show_textblock_number', True)
+        pcfg.show_textblock_number = new_visible
+        if hasattr(self, 'st_manager'):
+            self.st_manager.set_numbers_visible(new_visible)
+
+    def shortcutAutoSortReadingOrder(self):
+        # Only meaningful in text edit mode where the undo stack accepts our
+        # RearrangeBlksCommand. Show a hint instead of silent-failing so users
+        # don't think the shortcut is broken.
+        if not self.canvas.textEditMode():
+            create_info_dialog(self.tr('Switch to text edit mode to auto-sort blocks.'))
+            return
+        if hasattr(self, 'st_manager'):
+            self.st_manager.auto_sort_reading_order()
+
+    def shortcutQuickReorder(self):
+        # Ctrl+J handler: spawn the quick-reorder numeric popup over the
+        # currently focused block's badge. Pre-conditions mirror
+        # shortcutAutoSortReadingOrder so the two stay consistent:
+        #   * must be in text edit mode (RearrangeBlksCommand depends on the
+        #     text undo stack being live)
+        #   * a block must be identifiable -- via canvas.selected_text_items()
+        #     first, falling back to the shape-control bound block. If neither
+        #     exists, prompt the user instead of silently no-oping.
+        if shared.HEADLESS:
+            return
+        if not self.canvas.textEditMode():
+            create_info_dialog(self.tr('Switch to text edit mode to reorder blocks.'))
+            return
+        if not hasattr(self, 'st_manager'):
+            return
+
+        # Multi-select policy: when more than one block is selected we use the
+        # FIRST in scene order (selected_text_items returns sorted by idx by
+        # default). Reordering only one of N selected blocks is more
+        # predictable than batch-moving all of them; users can still drag-
+        # select+Move-to-top from the context menu if they need batch ops.
+        target_blk = None
+        sel = self.canvas.selected_text_items()
+        if sel:
+            target_blk = sel[0]
+        elif self.canvas.txtblkShapeControl.blk_item is not None:
+            target_blk = self.canvas.txtblkShapeControl.blk_item
+
+        if target_blk is None:
+            create_info_dialog(self.tr('Select a text block first.'))
+            return
+
+        idx = getattr(target_blk, 'idx', None)
+        if idx is None:
+            return
+        self.st_manager.open_quick_reorder_popup(idx)
+
+    def _move_selected_block(self, target_provider):
+        # Shared body for Alt+Up/Down/Home/End shortcuts. target_provider is a
+        # callable (current_idx, n) -> desired_final_idx so each shortcut just
+        # specifies "where this block should land". Bounds checking lives in
+        # st_manager.move_block_to_position so we can pass any int.
+        if shared.HEADLESS:
+            return
+        if not self.canvas.textEditMode():
+            return
+        if not hasattr(self, 'st_manager'):
+            return
+        target_blk = None
+        sel = self.canvas.selected_text_items()
+        if sel:
+            target_blk = sel[0]
+        elif self.canvas.txtblkShapeControl.blk_item is not None:
+            target_blk = self.canvas.txtblkShapeControl.blk_item
+        if target_blk is None:
+            return
+        idx = getattr(target_blk, 'idx', None)
+        if idx is None:
+            return
+        n = len(self.st_manager.textblk_item_list)
+        if n < 2:
+            return
+        target = target_provider(idx, n)
+        self.st_manager.move_block_to_position(idx, target)
+
+    def shortcutMoveBlockUp(self):
+        self._move_selected_block(lambda idx, n: idx - 1)
+
+    def shortcutMoveBlockDown(self):
+        self._move_selected_block(lambda idx, n: idx + 1)
+
+    def shortcutMoveBlockTop(self):
+        self._move_selected_block(lambda idx, n: 0)
+
+    def shortcutMoveBlockBottom(self):
+        self._move_selected_block(lambda idx, n: n - 1)
 
     def setPaintMode(self):
         if self.bottomBar.paintChecker.isChecked():
@@ -1224,6 +1678,16 @@ class MainWindow(mainwindow_cls):
             self.bottomBar.originalSlider.show()
             self.bottomBar.textlayerSlider.show()
             self.bottomBar.textblockChecker.hide()
+            # Force the brush/cross cursor to refresh once the panel and its
+            # parent stack are unambiguously visible. Without this the very
+            # first time the user enters paint mode (drawingPanel had never
+            # been shown before, so its showEvent fires while the parent
+            # stack is still in transition) the canvas keeps the previous
+            # ScrollHandCursor and the brush circle never appears on hover.
+            # Deferring to the next event-loop tick gives Qt time to flip
+            # the visibility chain so isVisible() reports True downstream.
+            from qtpy.QtCore import QTimer as _QTimer
+            _QTimer.singleShot(0, self.drawingPanel.refreshCurrentToolCursor)
         else:
             self.canvas.setPaintMode(False)
             self.rightComicTransStackPanel.setHidden(True)
@@ -1572,44 +2036,18 @@ class MainWindow(mainwindow_cls):
             self.saveCurrentPage(update_scene_text=False, save_proj=True, restore_interface=False, save_rst_only=False)
             
             self.activateWindow()
-            # ALWAYS restore canvas focus after pipeline finished to ensure keyboard shortcuts work
-            # Set focus immediately first, then use QTimer as backup to ensure focus persists
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
-            # Use QTimer to ensure focus is set after all UI updates are complete
-            from qtpy.QtCore import QTimer
-            def restore_canvas_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            # Use longer delay to ensure all UI operations are complete
-            QTimer.singleShot(200, restore_canvas_focus)
-            # Also set focus again after a longer delay to ensure it persists
-            QTimer.singleShot(500, restore_canvas_focus)
-            # Final check after 1 second to ensure focus is maintained
-            QTimer.singleShot(1000, restore_canvas_focus)
-            # Additional check after 2 seconds to ensure focus persists
-            QTimer.singleShot(2000, restore_canvas_focus)
-            # Final check after 3 seconds to ensure focus is maintained
-            QTimer.singleShot(3000, restore_canvas_focus)
-            
-            
-            # CRITICAL: Force canvas focus one more time after all timers are set
-            # This ensures focus is set even if something steals it immediately
-            from qtpy.QtCore import QTimer
+            # Restore canvas focus after the pipeline finishes so A/D/N/W still
+            # work. Spread retries cover the progress-dialog hide window and
+            # any late activation events; each retry is idle-checked so we
+            # never yank focus out of a translation field.
+            self._restore_canvas_focus_if_idle()
             def force_canvas_focus_final():
                 self.activateWindow()
                 QApplication.setActiveWindow(self)
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(50, force_canvas_focus_final)  # Very short delay to ensure it runs after other operations
-            # Also force focus after progress dialog is hidden (if it exists)
-            # Progress dialog hiding might steal focus
-            def restore_after_progress_hide():
-                self.activateWindow()
-                QApplication.setActiveWindow(self)
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(300, restore_after_progress_hide)  # Delay to ensure progress dialog is hidden
+                self._restore_canvas_focus_if_idle()
+            QTimer.singleShot(50, force_canvas_focus_final)
+            QTimer.singleShot(300, force_canvas_focus_final)
+            QTimer.singleShot(1000, self._restore_canvas_focus_if_idle)
 
     def postprocess_translations(self, blk_list: List[TextBlock]) -> None:
         src_is_cjk = is_cjk(pcfg.module.translate_source)
@@ -1791,8 +2229,9 @@ class MainWindow(mainwindow_cls):
                         blk_item.setSelected(True)
                 self.canvas.block_selection_signal = False
                 self.st_manager.textEditList.set_selected_list(selected_item_ids)
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
+            # Use idle-checked restore so autosave does not yank focus out of
+            # a translation/source field the user is actively typing in.
+            self._restore_canvas_focus_if_idle()
 
             if shape_control_visible and shape_control_blk_item_id is not None:
                 for blk_item in self.st_manager.textblk_item_list:
@@ -1805,8 +2244,7 @@ class MainWindow(mainwindow_cls):
                 self.st_manager.showTextblkItemRect(True)
                 if not self.canvas.textblock_mode:
                     self.canvas.textblock_mode = True
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
+            self._restore_canvas_focus_if_idle()
         finally:
             # Always release the running flag even if saveCurrentPage raised; the
             # in-flight pending counter is still authoritative for queued writes.
@@ -1945,16 +2383,11 @@ class MainWindow(mainwindow_cls):
         # 如果有指定pages_to_process或者是continue_mode，则传递页面列表
         self.module_manager.runImgtransPipeline(pages_to_process if (pages_to_process or continue_mode) else None)
         
-        # ALWAYS ensure canvas has focus when starting pipeline
-        # This ensures keyboard shortcuts work immediately
-        if not self.canvas.gv.hasFocus():
-            self.canvas.gv.setFocus()
-        # Use QTimer to ensure focus persists after pipeline starts
-        from qtpy.QtCore import QTimer
-        def ensure_canvas_focus():
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
-        QTimer.singleShot(100, ensure_canvas_focus)
+        # Restore canvas focus when starting the pipeline so A/D/N/W still
+        # respond once the run begins. Idle-checked so we never yank focus out
+        # of a translation field if the user kicked off the run from there.
+        self._restore_canvas_focus_if_idle()
+        QTimer.singleShot(100, self._restore_canvas_focus_if_idle)
 
     def on_transpanel_changed(self):
         self.canvas.editor_index = self.rightComicTransStackPanel.currentIndex()
@@ -2070,21 +2503,11 @@ class MainWindow(mainwindow_cls):
             self.save_all_pages()
             # Export
             self.on_export_txt(dump_target='source', suffix='.txt')
-            # Restore canvas focus after export (on_export_txt already handles this, but ensure it's done)
-            from qtpy.QtCore import QTimer
-            def restore_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(300, restore_focus)
+            QTimer.singleShot(300, self._restore_canvas_focus_if_idle)
         except Exception as e:
             create_error_dialog(e, self.tr('Failed to export source as TEXT file'))
-            # Restore canvas focus even if error occurred
-            from qtpy.QtCore import QTimer
-            def restore_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(200, restore_focus)
-    
+            QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
+
     def on_import_trans_txt_quick(self):
         """Import translation TXT from quick menu - ensure save system works"""
         try:
@@ -2095,39 +2518,19 @@ class MainWindow(mainwindow_cls):
                 # Save current page if there are changes
                 if self.canvas.projstate_unsaved or self.canvas.text_change_unsaved():
                     self.saveCurrentPage(update_scene_text=True, save_proj=True, restore_interface=False, save_rst_only=False)
-            # Restore canvas focus after import (on_import_trans_txt already handles this, but ensure it's done)
-            from qtpy.QtCore import QTimer
-            def restore_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(300, restore_focus)
+            QTimer.singleShot(300, self._restore_canvas_focus_if_idle)
         except Exception as e:
             create_error_dialog(e, self.tr('Failed to import translation from TXT file'))
-            # Restore canvas focus even if error occurred
-            from qtpy.QtCore import QTimer
-            def restore_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(200, restore_focus)
-    
+            QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
+
     def on_export_txt(self, dump_target, suffix='.txt'):
         try:
             self.imgtrans_proj.dump_txt(dump_target=dump_target, suffix=suffix)
             create_info_dialog(self.tr('Text file exported to ') + self.imgtrans_proj.dump_txt_path(dump_target, suffix))
-            # Restore canvas focus after dialog is closed
-            from qtpy.QtCore import QTimer
-            def restore_focus_after_dialog():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(200, restore_focus_after_dialog)
+            QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
         except Exception as e:
             create_error_dialog(e, self.tr('Failed to export as TEXT file'))
-            # Restore canvas focus even if error occurred
-            from qtpy.QtCore import QTimer
-            def restore_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(200, restore_focus)
+            QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
 
     def on_import_trans_txt(self):
         try:
@@ -2146,12 +2549,8 @@ class MainWindow(mainwindow_cls):
                 # Restore text block mode after updating scene items
                 if self.bottomBar.textblockChecker.isChecked() or pcfg.imgtrans_textblock:
                     self.setTextBlockMode()
-                # Restore canvas focus after import
-                from qtpy.QtCore import QTimer
-                def restore_canvas_focus():
-                    if not self.canvas.gv.hasFocus():
-                        self.canvas.gv.setFocus()
-                QTimer.singleShot(100, restore_canvas_focus)
+                # Restore canvas focus after import (idle-checked).
+                QTimer.singleShot(100, self._restore_canvas_focus_if_idle)
 
             if all_matched:
                 msg = self.tr('Translation imported and matched successfully.')
@@ -2173,21 +2572,11 @@ class MainWindow(mainwindow_cls):
                     blk.translation = self.mtSubWidget.sub_text(blk.translation)
             
             create_info_dialog(msg)
-            # Restore canvas focus after dialog is closed
-            from qtpy.QtCore import QTimer
-            def restore_focus_after_dialog():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(200, restore_focus_after_dialog)
+            QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
 
         except Exception as e:
             create_error_dialog(e, self.tr('Failed to import translation from ') + selected_file)
-            # Restore canvas focus even if error occurred
-            from qtpy.QtCore import QTimer
-            def restore_focus():
-                if not self.canvas.gv.hasFocus():
-                    self.canvas.gv.setFocus()
-            QTimer.singleShot(200, restore_focus)
+            QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
 
     def on_reveal_file(self):
         current_img_path = self.imgtrans_proj.current_img_path()
@@ -2210,33 +2599,18 @@ class MainWindow(mainwindow_cls):
             self.leftStackWidget.hide()
 
     def on_fin_export_doc(self):
-        # Restore canvas focus after export
-        from qtpy.QtCore import QTimer
-        def restore_focus():
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
-        QTimer.singleShot(200, restore_focus)
+        QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
         msg = QMessageBox()
         msg.setText(self.tr('Export to ') + self.imgtrans_proj.doc_path())
         msg.exec_()
-        # Restore canvas focus after dialog is closed
-        from qtpy.QtCore import QTimer
-        def restore_focus_after_dialog():
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
-        QTimer.singleShot(200, restore_focus_after_dialog)
+        QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
 
     def on_fin_import_doc(self):
         self.st_manager.updateSceneTextitems()
         # Restore text block mode after updating scene items
         if self.bottomBar.textblockChecker.isChecked() or pcfg.imgtrans_textblock:
             self.setTextBlockMode()
-        # Restore canvas focus after import
-        from qtpy.QtCore import QTimer
-        def restore_canvas_focus():
-            if not self.canvas.gv.hasFocus():
-                self.canvas.gv.setFocus()
-        QTimer.singleShot(100, restore_canvas_focus)
+        QTimer.singleShot(100, self._restore_canvas_focus_if_idle)
 
     def on_global_replace_finished(self):
         rt = self.global_search_widget.replace_thread

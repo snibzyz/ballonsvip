@@ -343,10 +343,12 @@ class TitleBar(Widget):
         redoAction.setShortcut(QKeySequence.StandardKey.Redo)
         pageSearchAction = QAction(self.tr('Search'), self)
         self.page_search_trigger = pageSearchAction.triggered
-        pageSearchAction.setShortcut(QKeySequence('Ctrl+F'))
+        # Thai (Kedmanee) layout: Ctrl+ด is the same physical Ctrl+F.
+        pageSearchAction.setShortcuts([QKeySequence('Ctrl+F'), QKeySequence('Ctrl+ด')])
         globalSearchAction = QAction(self.tr('Global Search'), self)
         self.global_search_trigger = globalSearchAction.triggered
-        globalSearchAction.setShortcut(QKeySequence('Ctrl+G'))
+        # Thai (Kedmanee) layout: Ctrl+เ is the same physical Ctrl+G.
+        globalSearchAction.setShortcuts([QKeySequence('Ctrl+G'), QKeySequence('Ctrl+เ')])
 
         replacePreMTkeyword = QAction(self.tr("Keyword substitution for machine translation source text"), self)
         self.replacePreMTkeyword_trigger = replacePreMTkeyword.triggered
@@ -380,9 +382,11 @@ class TitleBar(Widget):
         self.displayLanguageMenu.addActions(lang_actions)
 
         drawBoardAction = QAction(self.tr('Drawing Board'), self)
-        drawBoardAction.setShortcut(QKeySequence('P'))
+        # Thai (Kedmanee): physical P key produces 'ฯ'.
+        drawBoardAction.setShortcuts([QKeySequence('P'), QKeySequence('ฯ')])
         texteditAction = QAction(self.tr('Text Editor'), self)
-        texteditAction.setShortcut(QKeySequence('T'))
+        # Thai (Kedmanee): physical T key produces 'ะ'.
+        texteditAction.setShortcuts([QKeySequence('T'), QKeySequence('ะ')])
         importTextStyles = QAction(self.tr('Import Text Styles'), self)
         exportTextStyles = QAction(self.tr('Export Text Styles'), self)
         self.darkModeAction = darkModeAction = QAction(self.tr('Dark Mode'), self)
@@ -423,7 +427,8 @@ class TitleBar(Widget):
         
         # 区域合并工具
         mergeToolAction = QAction('区域合并工具', self)
-        mergeToolAction.setShortcut(QKeySequence('Ctrl+Shift+M'))
+        # Thai (Kedmanee): physical M key produces 'ท'.
+        mergeToolAction.setShortcuts([QKeySequence('Ctrl+Shift+M'), QKeySequence('Ctrl+Shift+ท')])
         self.merge_tool_trigger = mergeToolAction.triggered
         
         toolsMenu = QMenu(self.toolsToolBtn)

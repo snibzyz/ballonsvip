@@ -439,7 +439,12 @@ class DrawingPanel(Widget):
         self.canvas.erasing_pen = self.inpaint_pen
         self.canvas.painting_shape = self.inpaintConfigPanel.shape
         self.toolConfigStackwidget.setCurrentWidget(self.inpaintConfigPanel)
-        if self.isVisible():
+        # Apply the brush cursor whenever paint mode is the active canvas
+        # state -- not gated on drawingPanel.isVisible(). On startup the
+        # config-driven setChecked(True) fires this slot before the panel is
+        # ever shown, so an isVisible() gate skipped cursor application and
+        # the user had to toggle P repeatedly to force a refresh.
+        if getattr(self.canvas, 'painting', False):
             self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.setInpaintCursor()
 
@@ -453,7 +458,7 @@ class DrawingPanel(Widget):
         self.canvas.erasing_pen = self.erasing_pen
         self.canvas.image_edit_mode = ImageEditMode.PenTool
         self.toolConfigStackwidget.setCurrentWidget(self.penConfigPanel)
-        if self.isVisible():
+        if getattr(self.canvas, 'painting', False):
             self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.setPenCursor()
 
@@ -571,10 +576,35 @@ class DrawingPanel(Widget):
             self.setInpaintToolWidth(self.inpaintConfigPanel.thicknessSlider.value())
 
     def showEvent(self, event) -> None:
+        # Re-arm the active tool when the panel becomes visible. The
+        # toggle-off-then-on dance fires the `checked` signal so the matching
+        # on_use_*tool slot rebinds canvas state (image_edit_mode, painting_pen).
+        rst = super().showEvent(event)
         if self.currentTool is not None:
             self.currentTool.setChecked(False)
             self.currentTool.setChecked(True)
-        return super().showEvent(event)
+            # The on_use_*tool slots set the brush cursor only when isVisible()
+            # is True, but during showEvent.super() return Qt has finally
+            # flipped the visibility flag. We re-issue the cursor explicitly
+            # afterwards so the brush circle never stays hidden when the user
+            # opens the paint panel via P -> "switch to paint mode" (the bug
+            # the user reported as "วงกลม brush หาย"). Cheap idempotent ops:
+            # setCursor on the same QCursor is a no-op for Qt internals.
+            try:
+                if self.currentTool is self.inpaintTool:
+                    self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
+                    self.setInpaintCursor()
+                elif self.currentTool is self.penTool:
+                    self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
+                    self.setPenCursor()
+                elif self.currentTool is self.rectTool:
+                    self.setCrossCursor()
+            except Exception:
+                # Defensive: cursor pixmap construction can fail on stale
+                # canvas state during rapid show/hide; falling back to no
+                # cursor change is preferable to crashing the panel show.
+                pass
+        return rst
 
     def on_finish_painting(self, stroke_item: StrokeImgItem):
         stroke_item.finishPainting()
@@ -753,6 +783,31 @@ class DrawingPanel(Widget):
 
     def setInpaintCursor(self):
         self.canvas.gv.setCursor(self.get_pen_cursor(INPAINT_BRUSH_COLOR, self.inpaint_pen.width(), shape=self.inpaintConfigPanel.shape))
+
+    def refreshCurrentToolCursor(self):
+        # Forced re-application of the active tool's cursor + drag mode.
+        # Used after a deferred panel-show transition where on_use_*tool's
+        # `if self.isVisible()` gate was still False because the parent stack
+        # had not finished propagating visibility down. Idempotent: dispatch
+        # is by current tool identity, missing tools no-op silently.
+        try:
+            if self.currentTool is self.inpaintTool:
+                self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
+                self.setInpaintCursor()
+            elif self.currentTool is self.penTool:
+                self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
+                self.setPenCursor()
+            elif self.currentTool is self.rectTool:
+                self.canvas.gv.setDragMode(QGraphicsView.DragMode.NoDrag)
+                self.setCrossCursor()
+            elif self.currentTool is self.handTool:
+                self.canvas.gv.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        except Exception:
+            # Cursor pixmap composition can fail under low-VRAM conditions or
+            # if the canvas scale_factor is mid-transition. Swallowing keeps
+            # the panel transition visible to the user even if we can't paint
+            # the brush cursor right this instant.
+            pass
 
     def on_handchecker_changed(self):
         if self.handTool.isChecked():

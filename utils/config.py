@@ -173,6 +173,9 @@ class ProgramConfig(Config):
     expand_teffect_panel: bool = True
     text_advanced_format_panel: bool = True
     expand_tadvanced_panel: bool = True
+    # Toggle for the number badge floating above each TextBlkItem on the canvas.
+    # Persisted so the state survives restarts; default visible so users see it.
+    show_textblock_number: bool = True
 
     @staticmethod
     def load(cfg_path: str):

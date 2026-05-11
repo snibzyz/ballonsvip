@@ -14,6 +14,7 @@ from utils.fontformat import FontFormat, px2pt, pt2px
 from .misc import td_pattern, table_pattern
 from .scene_textlayout import VerticalTextDocumentLayout, HorizontalTextDocumentLayout, SceneTextLayout
 from .text_graphical_effect import apply_shadow_effect
+from .textblock_badge import TextBlockNumberBadge
 
 TEXTRECT_SHOW_COLOR = QColor(30, 147, 229, 170)
 TEXTRECT_SELECTED_COLOR = QColor(248, 64, 147, 170)
@@ -72,6 +73,12 @@ class TextBlkItem(QGraphicsTextItem):
         self.setBoundingRegionGranularity(0)
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
         self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        # Number badge is a child item: created once, follows position/rotation,
+        # but ignores zoom transforms so it stays a fixed pixel size on screen.
+        # SceneTextManager wires its signals; TextBlkItem itself does not own
+        # those connections so reset_with_blk doesn't have to disconnect anything.
+        self.number_badge: TextBlockNumberBadge = TextBlockNumberBadge(self, idx)
+        self.number_badge.updatePosition()
 
     def inputMethodEvent(self, e: QInputMethodEvent):
         if self.pre_editing == False:
@@ -308,6 +315,14 @@ class TextBlkItem(QGraphicsTextItem):
 
         # Snapshot undo step counter after init so subsequent edits can be detected.
         self.old_undo_steps = self.document().availableUndoSteps()
+        # Refresh the badge for the recycled item: its index, position, and any
+        # stale highlight from a previous drag must be cleared. Signal wiring on
+        # the badge persists across reuse (set in addTextBlkItem) so we MUST NOT
+        # rebuild the badge object here.
+        if getattr(self, 'number_badge', None) is not None:
+            self.number_badge.set_idx(idx)
+            self.number_badge.set_highlight(0)
+            self.number_badge.updatePosition()
         self.update()
 
     def setCenterTransform(self):
@@ -336,7 +351,7 @@ class TextBlkItem(QGraphicsTextItem):
         return QRectF(rect.x() - p, rect.y() - p, rect.width() + P, rect.height() + P)
 
     def setRect(self, rect: Union[List, QRectF], padding=True, repaint=True) -> None:
-        
+
         if isinstance(rect, List):
             rect = QRectF(*rect)
         if padding:
@@ -348,6 +363,9 @@ class TextBlkItem(QGraphicsTextItem):
         self.setCenterTransform()
         if repaint:
             self.repaint_background()
+        # Keep the floating badge anchored to the (possibly new) top-left.
+        if getattr(self, 'number_badge', None) is not None:
+            self.number_badge.updatePosition()
 
     def documentSize(self):
         return self.layout.documentSize()
@@ -519,38 +537,67 @@ class TextBlkItem(QGraphicsTextItem):
         # subpixel antialiasing is enabled for super().paint upon drawing on some non-transparent background https://github.com/dmMaze/BallonsTranslator/issues/919
         # which can be avoided by calling super().paint first, but it results in disappeared background in editting mode
         # so the checking logic lies here
-        
+
+        # Text opacity is applied per-draw inside this method rather than on
+        # the QGraphicsItem itself (see setOpacity). This keeps the selection
+        # frame and number badge fully visible even when text is set to a low
+        # opacity (or 0) -- otherwise the entire item, including the frame,
+        # disappears.
+        text_opacity = self.fontformat.opacity if self.fontformat is not None else 1.0
+        needs_text_opacity = text_opacity < 1.0
+        prev_painter_opacity = painter.opacity() if needs_text_opacity else 1.0
+
         if self.is_editting():
             self._draw_accessories(painter)
 
         option.state = QStyle.State_None
         option.palette.setBrush(QPalette.ColorRole.Highlight, QBrush(Qt.GlobalColor.transparent))
+        if needs_text_opacity:
+            painter.setOpacity(prev_painter_opacity * text_opacity)
         super().paint(painter, option, widget)
+        if needs_text_opacity:
+            painter.setOpacity(prev_painter_opacity)
 
         if not self.is_editting():
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOver)
+            if needs_text_opacity:
+                painter.setOpacity(prev_painter_opacity * text_opacity)
             self._draw_accessories(painter)
+            if needs_text_opacity:
+                painter.setOpacity(prev_painter_opacity)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+        # Frame is drawn last, at full painter opacity and normal composition,
+        # so it stays visible regardless of the text's opacity value. Without
+        # this, blocks with opacity 0 would render the badge but no surrounding
+        # frame, making selection hit-tests effectively invisible to the user.
+        self._draw_selection_frame(painter)
 
     def _draw_accessories(self, painter: QPainter):
         br = self.boundingRect()
         painter.save()
-        
+
         if self.background_pixmap is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawPixmap(br.toRect(), self.background_pixmap)
+        painter.restore()
 
-        # Show bounding box if draw_rect is enabled
-        # Selected blocks show pink dashed box, unselected blocks show blue solid box
-        # under_ctrl is only used for shape control operations, not for bounding box display
-        if self.isSelected() and not self.is_editting():
+    def _draw_selection_frame(self, painter: QPainter):
+        # Draws the bounding-rect outline (pink dashed when selected, blue
+        # solid when draw_rect is enabled). Lives outside _draw_accessories
+        # so paint() can call it at full opacity after the text content.
+        if self.is_editting():
+            return
+        if self.isSelected():
             pen = QPen(TEXTRECT_SELECTED_COLOR, 3.5 / self.get_scale(), Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            painter.drawRect(self.unpadRect(br))
-        elif self.draw_rect and not self.is_editting():
+        elif self.draw_rect:
             pen = QPen(TEXTRECT_SHOW_COLOR, 3 / self.get_scale(), Qt.PenStyle.SolidLine)
-            painter.setPen(pen)
-            painter.drawRect(self.unpadRect(br))
+        else:
+            return
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(self.unpadRect(self.boundingRect()))
         painter.restore()
 
     def startEdit(self, pos: QPointF = None) -> None:
@@ -1108,8 +1155,18 @@ class TextBlkItem(QGraphicsTextItem):
         self.old_ffmt_values = None
 
     def setOpacity(self, opacity: float):
-        super().setOpacity(opacity)
-        self.fontformat.opacity = opacity
+        # Intentionally NOT calling super().setOpacity. Setting opacity on the
+        # QGraphicsItem fades everything inside it, including child items (the
+        # number badge) and the selection frame -- which would make a block
+        # set to opacity 0 effectively un-selectable on the canvas because no
+        # outline or badge would be visible. Instead we store the value on the
+        # fontformat and apply it only to the text rendering in paint().
+        if self.fontformat is not None:
+            self.fontformat.opacity = opacity
+        # Invalidate the DeviceCoordinateCache so the next paint picks up the
+        # new opacity. Without this, the cached pixmap from the previous value
+        # would keep being blitted.
+        self.update()
 
     def setPlainTextAndKeepUndoStack(self, text: str):
         cursor = QTextCursor(self.document())
@@ -1196,3 +1253,7 @@ class TextBlkItem(QGraphicsTextItem):
         self.setPos(self.pos() + pos_shift)
         if self.blk is not None and set_blk_size:
             self.blk._bounding_rect = self.absBoundingRect()
+        # Reanchor the badge: set_size mutates _display_rect (top-left in local
+        # coords stays at (0,0) but the visual rect may shift after pos change).
+        if getattr(self, 'number_badge', None) is not None:
+            self.number_badge.updatePosition()

@@ -305,6 +305,12 @@ class ScrollBar(QWidget):
 
     def mousePressEvent(self, e: QMouseEvent):
         super().mousePressEvent(e)
+        # Accept so the press is not propagated to the parent QGraphicsView's
+        # viewport. Without this, dragging the scrollbar in paint mode would
+        # also activate the brush because QWidget.mousePressEvent defaults to
+        # ignoring the event, which lets it bubble through to the underlying
+        # canvas.
+        e.accept()
         self._isPressed = True
         self._pressedPos = e.pos()
 
@@ -327,6 +333,7 @@ class ScrollBar(QWidget):
 
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
+        e.accept()
         self._isPressed = False
         self.sliderReleased.emit()
 
@@ -342,6 +349,7 @@ class ScrollBar(QWidget):
 
         self._pressedPos = e.pos()
         self.sliderMoved.emit()
+        e.accept()
 
     def _adjustPos(self, size):
         if self.orientation() == Qt.Vertical:

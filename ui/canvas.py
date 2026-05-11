@@ -134,27 +134,37 @@ class CustomGV(QGraphicsView):
     
     def focusOutEvent(self, event: QFocusEvent) -> None:
         """Track when canvas loses focus"""
-        
+
         # Auto-restore focus if it was lost to a non-interactive widget or window activation
         reason = event.reason()
         new_focus = QApplication.focusWidget()
-        
+
         # Don't restore if user is actively editing text (SourceTextEdit, TransTextEdit)
         from .textedit_area import SourceTextEdit, TransTextEdit
         if isinstance(new_focus, (SourceTextEdit, TransTextEdit)):
             return super().focusOutEvent(event)
-        
+
+        # Wrap the deferred setFocus in try/RuntimeError so a CustomGV that
+        # was Qt-deleted between scheduling and firing (e.g. during program
+        # close) doesn't raise from "wrapped C/C++ object has been deleted".
+        def _restore():
+            try:
+                if not self.hasFocus():
+                    self.setFocus()
+            except RuntimeError:
+                return
+
         # Restore focus after a short delay if focus was lost due to window activation
         # or if focus went to None (no widget has focus)
         # Use Qt.FocusReason enum values (ActiveWindowFocusReason = 4)
         if reason == Qt.FocusReason.ActiveWindowFocusReason or new_focus is None:
-            QTimer.singleShot(100, lambda: self.setFocus() if not self.hasFocus() else None)
+            QTimer.singleShot(100, _restore)
         # Also restore focus if focus was lost to a non-interactive widget (like QLabel, QWidget, etc.)
         elif new_focus is not None:
             # Check if the new focus widget is interactive (can receive keyboard input)
             if not new_focus.focusPolicy() in (Qt.FocusPolicy.StrongFocus, Qt.FocusPolicy.WheelFocus, Qt.FocusPolicy.ClickFocus):
-                QTimer.singleShot(100, lambda: self.setFocus() if not self.hasFocus() else None)
-        
+                QTimer.singleShot(100, _restore)
+
         return super().focusOutEvent(event)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
@@ -197,6 +207,16 @@ class Canvas(QGraphicsScene):
     layout_textblks = Signal()
     reset_angle = Signal()
     squeeze_blk = Signal()
+
+    # Reorder ops surfaced from the right-click context menu. MainWindow wires
+    # them to its existing shortcutMoveBlock* / shortcutQuickReorder /
+    # shortcutAutoSortReadingOrder handlers so menu and keyboard share logic.
+    reorder_to_top = Signal()
+    reorder_up = Signal()
+    reorder_down = Signal()
+    reorder_to_bottom = Signal()
+    reorder_to_position = Signal()
+    reorder_auto_sort = Signal()
 
     run_blktrans = Signal(int)
 
@@ -427,6 +447,16 @@ class Canvas(QGraphicsScene):
             item.draw_rect = False
             item.update()
 
+        # Hide number badges so they don't bleed into the saved/exported image.
+        # Badges are child QGraphicsItems of TextBlkItem on textLayer, so self.render()
+        # would otherwise rasterise them on top of the result.
+        prev_badge_visible = []
+        for item in text_items:
+            badge = getattr(item, 'number_badge', None)
+            if badge is not None:
+                prev_badge_visible.append((badge, badge.isVisible()))
+                badge.setVisible(False)
+
         result = ndarray2pixmap(self.imgtrans_proj.inpainted_array, return_qimg=True)
         canvas_sz = self.img_window_size()
         painter = QPainter(result)
@@ -440,6 +470,9 @@ class Canvas(QGraphicsScene):
             for item, prev in prev_draw_rect:
                 item.draw_rect = prev
                 item.update()
+            # Restore badge visibility.
+            for badge, prev in prev_badge_visible:
+                badge.setVisible(prev)
 
             if tlayer_opacity_before != 1:
                 self.textLayer.setOpacity(tlayer_opacity_before)
@@ -825,8 +858,13 @@ class Canvas(QGraphicsScene):
         self.clearSelection()
         self.setProjSaveState(False)
         self.updateLayers()
-        # force release of dropped pixmaps from previous page (GPU memory)
-        gc.collect()
+        # NOTE: previously a gc.collect() was called here to force-release the
+        # dropped QPixmap from the prior page. Since the object pool keeps
+        # TextBlkItem instances alive across page switches, that collection no
+        # longer reclaims much; meanwhile a synchronous gc during scene
+        # teardown can trigger __del__ on Qt-wrapped objects mid-rebuild and
+        # crash the renderer. The base_pixmap = None reassignment in
+        # updateLayers() is sufficient for the QPixmap refcount to drop.
 
         if self.base_pixmap is not None:
             pixmap = self.base_pixmap.copy()
@@ -903,6 +941,22 @@ class Canvas(QGraphicsScene):
             layout_act = menu.addAction(self.tr("Auto layout"))
             angle_act = menu.addAction(self.tr("Reset Angle"))
             squeeze_act = menu.addAction(self.tr("Squeeze"))
+
+            menu.addSeparator()
+            # Reorder group: discoverable via menu, fully driven by shortcuts.
+            move_to_pos_act = menu.addAction(self.tr("Move to position..."))
+            move_to_pos_act.setShortcut(QKeySequence("Ctrl+J"))
+            move_top_act = menu.addAction(self.tr("Move to top"))
+            move_top_act.setShortcut(QKeySequence("Alt+Home"))
+            move_up_act = menu.addAction(self.tr("Move up"))
+            move_up_act.setShortcut(QKeySequence("Alt+Up"))
+            move_down_act = menu.addAction(self.tr("Move down"))
+            move_down_act.setShortcut(QKeySequence("Alt+Down"))
+            move_bottom_act = menu.addAction(self.tr("Move to bottom"))
+            move_bottom_act.setShortcut(QKeySequence("Alt+End"))
+            auto_sort_act = menu.addAction(self.tr("Auto-sort reading order"))
+            auto_sort_act.setShortcut(QKeySequence("Ctrl+Shift+R"))
+
             menu.addSeparator()
             translate_act = menu.addAction(self.tr("translate"))
             ocr_act = menu.addAction(self.tr("OCR"))
@@ -933,6 +987,18 @@ class Canvas(QGraphicsScene):
                 self.reset_angle.emit()
             elif rst == squeeze_act:
                 self.squeeze_blk.emit()
+            elif rst == move_to_pos_act:
+                self.reorder_to_position.emit()
+            elif rst == move_top_act:
+                self.reorder_to_top.emit()
+            elif rst == move_up_act:
+                self.reorder_up.emit()
+            elif rst == move_down_act:
+                self.reorder_down.emit()
+            elif rst == move_bottom_act:
+                self.reorder_to_bottom.emit()
+            elif rst == auto_sort_act:
+                self.reorder_auto_sort.emit()
             elif rst == translate_act:
                 self.run_blktrans.emit(-1)
             elif rst == ocr_act:
