@@ -362,26 +362,29 @@ class DrawingPanel(Widget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
     def setCurrentToolByName(self, tool_name: str):
+        method_name = f'on_use_{tool_name}tool'
+        set_method = getattr(self, method_name, None)
+        if set_method is None:
+            LOGGER.error('%s not found in drawing panel', method_name)
+            return
         try:
-            set_method = f'on_use_{tool_name}tool'
-            set_method = getattr(self, set_method)
             set_method()
             if self.currentTool is not None:
                 self.currentTool.setChecked(True)
-        except:
-            LOGGER.error(f'{set_method} not found in drawing panel')
+        except Exception:
+            LOGGER.exception('failed to switch drawing tool: %s', tool_name)
 
     def shortcutSetCurrentToolByName(self, tool_name: str):
         if self.isVisible():
             self.setCurrentToolByName(tool_name)
 
     def setShortcutTip(self, tool_name: str, shortcut: str):
-        try:
-            tool = f'{tool_name}Tool'
-            tool: QStackedWidget = getattr(self, tool)
-            tool.setToolTip(f'{shortcut}')
-        except:
-            LOGGER.error(f'{tool} not found in drawing panel')
+        attr_name = f'{tool_name}Tool'
+        tool: QStackedWidget = getattr(self, attr_name, None)
+        if tool is None:
+            LOGGER.error('%s not found in drawing panel', attr_name)
+            return
+        tool.setToolTip(f'{shortcut}')
 
     def initDLModule(self, module_manager: ModuleManager):
         self.module_manager = module_manager

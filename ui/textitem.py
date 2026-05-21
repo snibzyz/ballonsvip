@@ -11,7 +11,7 @@ from qtpy.QtGui import (QGradient, QKeyEvent, QFont, QTextCursor, QPixmap, QPain
 from utils.textblock import TextBlock, FontFormat, TextAlignment, LineSpacingType
 from utils.imgproc_utils import xywh2xyxypoly, rotate_polygons
 from utils.fontformat import FontFormat, px2pt, pt2px
-from .misc import td_pattern, table_pattern
+from .misc import td_pattern, table_pattern, match_shortcut, VK, MOD_CTRL, MOD_CTRL_SHIFT
 from .scene_textlayout import VerticalTextDocumentLayout, HorizontalTextDocumentLayout, SceneTextLayout
 from .text_graphical_effect import apply_shadow_effect
 from .textblock_badge import TextBlockNumberBadge
@@ -81,7 +81,7 @@ class TextBlkItem(QGraphicsTextItem):
         self.number_badge.updatePosition()
 
     def inputMethodEvent(self, e: QInputMethodEvent):
-        if self.pre_editing == False:
+        if not self.pre_editing:
             cursor = self.textCursor()
             self.input_method_from = cursor.selectionStart()
         if e.preeditString() == '':
@@ -485,25 +485,25 @@ class TextBlkItem(QGraphicsTextItem):
             e.setAccepted(True)
             return
 
-        if e.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            if e.key() == Qt.Key.Key_Z:
+        # Layout-independent: Qt.Key_Z/Y/V come back as Qt.Key_thai_*/etc.
+        # under non-Latin layouts, so match on Windows VK + masked mods.
+        if match_shortcut(e, MOD_CTRL, VK.Z):
+            e.accept()
+            self.undo_signal.emit()
+            return
+        elif match_shortcut(e, MOD_CTRL, VK.Y):
+            e.accept()
+            self.redo_signal.emit()
+            return
+        elif match_shortcut(e, MOD_CTRL, VK.V):
+            if self.isEditing():
                 e.accept()
-                self.undo_signal.emit()
+                self.pasted.emit(self.idx)
                 return
-            elif e.key() == Qt.Key.Key_Y:
-                e.accept()
-                self.redo_signal.emit()
-                return
-            elif e.key() == Qt.Key.Key_V:
-                if self.isEditing():
-                    e.accept()
-                    self.pasted.emit(self.idx)
-                    return
-        elif e.modifiers() == Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier:
-            if e.key() == Qt.Key.Key_Z:
-                e.accept()
-                self.redo_signal.emit()
-                return
+        elif match_shortcut(e, MOD_CTRL_SHIFT, VK.Z):
+            e.accept()
+            self.redo_signal.emit()
+            return
         elif e.key() == Qt.Key.Key_Return:
             e.accept()
             self.textCursor().insertText('\n')
@@ -803,16 +803,33 @@ class TextBlkItem(QGraphicsTextItem):
             self.setLetterSpacing(ffmat.letter_spacing)
         self.setLineSpacing(ffmat.line_spacing)
         
-        # Preserve gradient properties
+        # Preserve gradient properties. Skip the repaint when nothing
+        # gradient-related actually changed -- previously every fontformat
+        # apply (font size, color, ...) repainted gradient-enabled blocks,
+        # even when the gradient itself was untouched.
+        old_grad = (
+            self.fontformat.gradient_enabled,
+            self.fontformat.gradient_start_color,
+            self.fontformat.gradient_end_color,
+            self.fontformat.gradient_angle,
+            self.fontformat.gradient_size,
+        )
+        new_grad = (
+            ffmat.gradient_enabled,
+            ffmat.gradient_start_color,
+            ffmat.gradient_end_color,
+            ffmat.gradient_angle,
+            ffmat.gradient_size,
+        )
         self.fontformat.gradient_enabled = ffmat.gradient_enabled
         self.fontformat.gradient_start_color = ffmat.gradient_start_color
         self.fontformat.gradient_end_color = ffmat.gradient_end_color
         self.fontformat.gradient_angle = ffmat.gradient_angle
         self.fontformat.gradient_size = ffmat.gradient_size
-        
+
         self.fontformat.merge(ffmat)
-        
-        if self.fontformat.gradient_enabled:
+
+        if self.fontformat.gradient_enabled and old_grad != new_grad:
             self.update()
 
         self.repainting = False

@@ -19,13 +19,14 @@ from utils import shared
 from utils.message import create_error_dialog, create_info_dialog
 from modules.translators.trans_chatgpt import GPTTranslator
 from modules import GET_VALID_TEXTDETECTORS, GET_VALID_INPAINTERS, GET_VALID_TRANSLATORS, GET_VALID_OCR
-from .misc import parse_stylesheet, set_html_family, QKEY
+from .misc import parse_stylesheet, set_html_family, QKEY, _modint, SHORTCUT_MOD_MASK, MOD_NONE, MOD_CTRL, MOD_SHIFT, MOD_ALT, MOD_CTRL_SHIFT
 from utils.config import ProgramConfig, pcfg, save_config, text_styles, save_text_styles, load_textstyle_from, FontFormat
 from utils.proj_imgtrans import ProjImgTrans
 from .canvas import Canvas
 from .configpanel import ConfigPanel
 from .module_manager import ModuleManager
 from .textedit_area import SourceTextEdit, SelectTextMiniMenu, TransTextEdit
+from .textblock_badge import QuickReorderInputPopup
 from .drawingpanel import DrawingPanel
 from .scenetext_manager import SceneTextManager, TextPanel, PasteSrcItemsCommand
 from .mainwindowbars import TitleBar, LeftBar, BottomBar
@@ -105,6 +106,7 @@ class MainWindow(mainwindow_cls):
         self.setupUi()
         self.setupConfig()
         self.setupShortcuts()
+        self._build_vk_shortcut_table()
         self.setupRegisterWidget()
 
         # Global key event filter for layout-independent shortcut dispatch.
@@ -140,10 +142,6 @@ class MainWindow(mainwindow_cls):
             # https://bugreports.qt.io/browse/QTBUG-133215
             self.hideSystemTitleBar()
             self.showMaximized()
-        
-        # Set canvas focus after initialization (fix for keyboard shortcuts not working)
-        
-        # Set canvas focus after initialization - use QTimer to ensure it works
 
     def setStyleSheet(self, styleSheet: str) -> None:
         self.imgtrans_progress_msgbox.setStyleSheet(styleSheet)
@@ -711,11 +709,13 @@ class MainWindow(mainwindow_cls):
                 # No unsaved changes, just save normally
                 self.conditional_save(keep_exist_as_backup=True)
         
-        # Wait for save thread to finish
-        while True:
-            if not self.imsave_thread.isRunning():
-                break
-            time.sleep(0.1)
+        # Wait for save thread to finish. QThread.wait() blocks on an OS
+        # primitive instead of a 100ms Python poll, so the close path is
+        # noticeably snappier when save is already done; the 5 s timeout
+        # caps the worst case and prevents an indefinite hang if the
+        # writer thread is stuck on disk.
+        if self.imsave_thread.isRunning():
+            self.imsave_thread.wait(5000)
         self.st_manager.hovering_transwidget = None
         self.st_manager.blockSignals(True)
         self.canvas.prepareClose()
@@ -729,8 +729,7 @@ class MainWindow(mainwindow_cls):
         # internal QLineEdit, so the QLineEdit branch handles them. We also
         # match the popup widget directly since editable=False combos still
         # absorb arrow keys when popped.
-        from .textedit_area import SourceTextEdit, TransTextEdit
-        from .textblock_badge import QuickReorderInputPopup
+        # Imports are at module scope -- this function fires on every key event.
         if focus_widget is None:
             return False
         if isinstance(focus_widget, (SourceTextEdit, TransTextEdit, QuickReorderInputPopup)):
@@ -834,145 +833,111 @@ class MainWindow(mainwindow_cls):
             pass
         return super().eventFilter(obj, event)
 
+    def _build_vk_shortcut_table(self):
+        # (modifiers_int, native_vk) -> zero-arg callable.
+        # Modifier values come from ui.misc pre-computed constants
+        # (`int(Qt.KeyboardModifier.X)` raises on PyQt6 6.x, so we go via
+        # the .value accessor). native_vk is the Windows VK_* code returned
+        # by QKeyEvent.nativeVirtualKey() -- position-based, identical
+        # across every keyboard layout on Windows.
+        NONE = MOD_NONE
+        CTRL = MOD_CTRL
+        SHIFT = MOD_SHIFT
+        ALT = MOD_ALT
+        CTRL_SHIFT = MOD_CTRL_SHIFT
+
+        scale_up = lambda: self.canvas.gv.scale_up_signal.emit()
+        scale_down = lambda: self.canvas.gv.scale_down_signal.emit()
+
+        self._vk_shortcut_table = {
+            # Plain letters / symbols
+            (NONE, 0x41): self.shortcutBefore,                              # A
+            (NONE, 0x44): self.shortcutNext,                                # D
+            (NONE, 0x57): self.shortcutTextblock,                           # W
+            (NONE, 0x4E): self.shortcutToggleNumberBadge,                   # N
+            (NONE, 0x50): self.shortcutDrawboard,                           # P
+            (NONE, 0x54): self.shortcutTextedit,                            # T
+            (NONE, 0x48): lambda: self.drawingPanel.shortcutSetCurrentToolByName('hand'),    # H
+            (NONE, 0x52): lambda: self.drawingPanel.shortcutSetCurrentToolByName('rect'),    # R
+            (NONE, 0x4A): lambda: self.drawingPanel.shortcutSetCurrentToolByName('inpaint'), # J
+            (NONE, 0x42): lambda: self.drawingPanel.shortcutSetCurrentToolByName('pen'),     # B
+            (NONE, 0xDB): self.drawingPanel.on_decre_pensize,               # [
+            (NONE, 0xDD): self.drawingPanel.on_incre_pensize,               # ]
+            (NONE, 0x20): self.shortcutSpace,                               # Space
+            (NONE, 0x1B): self.shortcutEscape,                              # Esc
+            (NONE, 0x2E): self.shortcutDelete,                              # Delete
+
+            # Ctrl chords
+            (CTRL, 0x41): self.shortcutSelectAll,                           # Ctrl+A
+            (CTRL, 0x42): self.shortcutBold,                                # Ctrl+B
+            (CTRL, 0x44): self.shortcutCtrlD,                               # Ctrl+D
+            (CTRL, 0x45): self.shortcutOCR,                                 # Ctrl+E
+            (CTRL, 0x46): self.on_page_search,                              # Ctrl+F
+            (CTRL, 0x47): self.on_global_search,                            # Ctrl+G
+            (CTRL, 0x49): self.shortcutItalic,                              # Ctrl+I
+            (CTRL, 0x4A): self.shortcutQuickReorder,                        # Ctrl+J
+            (CTRL, 0x4F): self.leftBar.onOpenFolder,                        # Ctrl+O
+            (CTRL, 0x52): self.reloadCurrentProject,                        # Ctrl+R
+            (CTRL, 0x53): self.manual_save,                                 # Ctrl+S
+            (CTRL, 0x55): self.shortcutUnderline,                           # Ctrl+U
+            (CTRL, 0x59): self.on_redo,                                     # Ctrl+Y
+            (CTRL, 0x5A): self.on_undo,                                     # Ctrl+Z
+            (CTRL, 0xBB): scale_up,                                         # Ctrl+=
+            (CTRL, 0xBD): scale_down,                                       # Ctrl+-
+
+            # Ctrl+Shift chords. Ctrl++ (Shift+= on US) also zooms in.
+            (CTRL_SHIFT, 0xBB): scale_up,                                   # Ctrl++
+            (CTRL_SHIFT, 0x4D): self.on_open_merge_tool,                    # Ctrl+Shift+M
+            (CTRL_SHIFT, 0x52): self.shortcutAutoSortReadingOrder,          # Ctrl+Shift+R
+
+            # Alt chords (navigation keys are layout-independent anyway,
+            # but routing through the same table keeps behaviour uniform).
+            (ALT, 0x26): self.shortcutMoveBlockUp,                          # Alt+Up
+            (ALT, 0x28): self.shortcutMoveBlockDown,                        # Alt+Down
+            (ALT, 0x24): self.shortcutMoveBlockTop,                         # Alt+Home
+            (ALT, 0x23): self.shortcutMoveBlockBottom,                      # Alt+End
+        }
+
     def _dispatch_shortcut_by_vk(self, event) -> bool:
-        # Mirror of the existing nativeVirtualKey table in keyPressEvent, but
-        # invoked from the QApplication-level eventFilter so the dispatch
-        # happens regardless of which widget is focused. Returns True when
-        # the event has been consumed.
+        # Layout-independent shortcut dispatch. Invoked from the
+        # QApplication-level eventFilter so it runs BEFORE Qt's character-
+        # based QShortcut matching -- which is what breaks on non-Latin
+        # layouts (Thai 'ก' produced by physical D never matches "Ctrl+D").
+        # Returns True when the event has been consumed.
         fw = QApplication.focusWidget()
         if self._focus_widget_is_text_input(fw):
+            return False
+
+        table = getattr(self, '_vk_shortcut_table', None)
+        if table is None:
             return False
 
         vk = event.nativeVirtualKey()
         if vk == 0:
             return False
 
-        mods = event.modifiers()
-        no_mod = (mods == Qt.KeyboardModifier.NoModifier)
-        ctrl_only = (mods == Qt.KeyboardModifier.ControlModifier)
-        ctrl_shift = (mods == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
-        alt_only = (mods == Qt.KeyboardModifier.AltModifier)
-
-        if no_mod:
-            if vk == 0x41:    # A -> previous page
-                self.shortcutBefore(); return True
-            if vk == 0x44:    # D -> next page
-                self.shortcutNext(); return True
-            if vk == 0x57:    # W -> toggle textblock outline
-                self.shortcutTextblock(); return True
-            if vk == 0x4E:    # N -> toggle number badges
-                self.shortcutToggleNumberBadge(); return True
-            if vk == 0xDB:    # [ -> brush size minus
-                self.drawingPanel.on_decre_pensize(); return True
-            if vk == 0xDD:    # ] -> brush size plus
-                self.drawingPanel.on_incre_pensize(); return True
-            if vk == 0x50:    # P -> toggle drawing board
-                self.shortcutDrawboard(); return True
-            if vk == 0x54:    # T -> toggle text editor
-                self.shortcutTextedit(); return True
-            # Drawing-tool selectors. These have Thai QShortcuts registered,
-            # but the Thai variants are combining marks for J/H/B which Qt
-            # cannot parse into valid QKeySequences, so dispatch by VK too.
-            if vk == 0x48:    # H -> hand tool
-                self.drawingPanel.shortcutSetCurrentToolByName('hand'); return True
-            if vk == 0x52:    # R -> rect tool
-                self.drawingPanel.shortcutSetCurrentToolByName('rect'); return True
-            if vk == 0x4A:    # J -> inpaint tool
-                self.drawingPanel.shortcutSetCurrentToolByName('inpaint'); return True
-            if vk == 0x42:    # B -> pen tool
-                self.drawingPanel.shortcutSetCurrentToolByName('pen'); return True
-
-        if ctrl_only:
-            if vk == 0x4A:    # Ctrl+J -> quick reorder popup
-                self.shortcutQuickReorder(); return True
-            if vk == 0x45:    # Ctrl+E -> OCR
-                self.shortcutOCR(); return True
-            if vk == 0x44:    # Ctrl+D -> delete current selection
-                self.shortcutCtrlD(); return True
-
-        if ctrl_shift:
-            if vk == 0x52:    # Ctrl+Shift+R -> auto-sort reading order
-                self.shortcutAutoSortReadingOrder(); return True
-
-        if alt_only:
-            if vk == 0x26:    # VK_UP
-                self.shortcutMoveBlockUp(); return True
-            if vk == 0x28:    # VK_DOWN
-                self.shortcutMoveBlockDown(); return True
-            if vk == 0x24:    # VK_HOME
-                self.shortcutMoveBlockTop(); return True
-            if vk == 0x23:    # VK_END
-                self.shortcutMoveBlockBottom(); return True
-
-        return False
+        mods = _modint(event.modifiers()) & SHORTCUT_MOD_MASK
+        handler = table.get((mods, vk))
+        if handler is None:
+            return False
+        try:
+            handler()
+        except Exception:
+            LOGGER.exception('shortcut handler failed for vk=0x%X mods=0x%X', vk, mods)
+            return False
+        return True
 
     def keyPressEvent(self, event):
-        # Layout-independent shortcut fallback. Qt's QShortcut("P") matches
-        # the character output of the active keyboard layout; on Thai layouts
-        # (Kedmanee, Pattachote, ...) physical P emits "ย"/"ัน"/etc., so the
-        # registered Latin shortcut never fires and the user has to flip IME
-        # state for every keypress. Routing by event.nativeVirtualKey() (the
-        # Windows VK_* code, identical across every Latin/Thai/CJK layout)
-        # keeps shortcuts working regardless of input language. We only run
-        # this fallback when the event reaches the main window unhandled --
-        # i.e. no QShortcut/QAction matched and no focused text editor
-        # consumed it -- so an English keyboard still hits the existing
-        # QShortcut path with no behaviour change.
+        # Belt-and-braces fallback for the rare case where the
+        # QApplication-level eventFilter didn't see this KeyPress (e.g. a
+        # custom widget that intercepts and re-posts events). Same table,
+        # same dispatch — see _dispatch_shortcut_by_vk for the full
+        # rationale on why we route by nativeVirtualKey().
         try:
-            fw = QApplication.focusWidget()
-            if self._focus_widget_is_text_input(fw):
-                return super().keyPressEvent(event)
-
-            vk = event.nativeVirtualKey()
-            mods = event.modifiers()
-            no_mod = (mods == Qt.KeyboardModifier.NoModifier)
-            ctrl_only = (mods == Qt.KeyboardModifier.ControlModifier)
-            ctrl_shift = (mods == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
-            alt_only = (mods == Qt.KeyboardModifier.AltModifier)
-
-            # Plain letter / symbol shortcuts.
-            if no_mod:
-                if vk == 0x41:    # A -> previous page
-                    self.shortcutBefore(); event.accept(); return
-                if vk == 0x44:    # D -> next page
-                    self.shortcutNext(); event.accept(); return
-                if vk == 0x57:    # W -> toggle textblock outline
-                    self.shortcutTextblock(); event.accept(); return
-                if vk == 0x4E:    # N -> toggle number badges
-                    self.shortcutToggleNumberBadge(); event.accept(); return
-                if vk == 0xDB:    # [ -> brush size minus
-                    self.drawingPanel.on_decre_pensize(); event.accept(); return
-                if vk == 0xDD:    # ] -> brush size plus
-                    self.drawingPanel.on_incre_pensize(); event.accept(); return
-                if vk == 0x50:    # P -> toggle drawing board
-                    self.shortcutDrawboard(); event.accept(); return
-                if vk == 0x54:    # T -> toggle text editor
-                    self.shortcutTextedit(); event.accept(); return
-
-            # Ctrl chords.
-            if ctrl_only:
-                if vk == 0x4A:    # Ctrl+J -> quick reorder popup
-                    self.shortcutQuickReorder(); event.accept(); return
-                if vk == 0x45:    # Ctrl+E -> OCR
-                    self.shortcutOCR(); event.accept(); return
-
-            # Ctrl+Shift chords.
-            if ctrl_shift:
-                if vk == 0x52:    # Ctrl+Shift+R -> auto-sort
-                    self.shortcutAutoSortReadingOrder(); event.accept(); return
-
-            # Alt + arrow / home / end -> reorder shortcuts.
-            if alt_only:
-                if vk == 0x26:    # VK_UP
-                    self.shortcutMoveBlockUp(); event.accept(); return
-                if vk == 0x28:    # VK_DOWN
-                    self.shortcutMoveBlockDown(); event.accept(); return
-                if vk == 0x24:    # VK_HOME
-                    self.shortcutMoveBlockTop(); event.accept(); return
-                if vk == 0x23:    # VK_END
-                    self.shortcutMoveBlockBottom(); event.accept(); return
+            if self._dispatch_shortcut_by_vk(event):
+                event.accept()
+                return
         except Exception:
-            # Defensive: never let a fallback fault block normal keyPress flow.
             pass
         return super().keyPressEvent(event)
 
@@ -1508,7 +1473,9 @@ class MainWindow(mainwindow_cls):
         """合并完成"""
         self.merge_thread.progress_bar.hide()
         
-        # 重新加载整个项目
+        # Reload the whole project after the region-merge tool finishes.
+        # A failure here leaves UI state pointing at pre-merge data, so we
+        # log + surface it instead of swallowing.
         try:
             json_path = self.imgtrans_proj.proj_path
             current_img = self.imgtrans_proj.current_img
@@ -1517,8 +1484,9 @@ class MainWindow(mainwindow_cls):
                 self.imgtrans_proj.set_current_img(current_img)
                 self.canvas.updateCanvas()
                 self.st_manager.updateSceneTextitems()
-        except:
-            pass
+        except Exception as e:
+            LOGGER.exception('Failed to reload project after merge tool')
+            create_error_dialog(e, self.tr('Failed to reload project after merge.'), 'MergeReloadFailed')
         
         # 显示结果
         total = success_count + fail_count
@@ -1826,8 +1794,10 @@ class MainWindow(mainwindow_cls):
                     if self.canvas.drawingLayer.drawed():
                         inpainted = self.canvas.base_pixmap.copy()
                         painter = QPainter(inpainted)
-                        painter.drawPixmap(0, 0, self.canvas.drawingLayer.get_drawed_pixmap())
-                        painter.end()
+                        try:
+                            painter.drawPixmap(0, 0, self.canvas.drawingLayer.get_drawed_pixmap())
+                        finally:
+                            painter.end()
                     else:
                         inpainted = self.imgtrans_proj.inpainted_array
                     if inpainted is not None:
@@ -2200,7 +2170,6 @@ class MainWindow(mainwindow_cls):
         # the main thread for the render. Encode+write itself is already offloaded to
         # imsave_thread, so the only remaining synchronous cost is the unavoidable
         # QGraphicsScene.render() (Qt requires this on the main thread).
-        from qtpy.QtCore import QTimer
         QTimer.singleShot(0, self._run_autosave_now)
 
     def _run_autosave_now(self):
@@ -2599,7 +2568,9 @@ class MainWindow(mainwindow_cls):
             self.leftStackWidget.hide()
 
     def on_fin_export_doc(self):
-        QTimer.singleShot(200, self._restore_canvas_focus_if_idle)
+        # Do NOT restore canvas focus before exec_(): exec_() runs a nested
+        # event loop, so a pre-scheduled timer would fire while the popup is
+        # still open and steal focus from its OK button, breaking Spacebar.
         msg = QMessageBox()
         msg.setText(self.tr('Export to ') + self.imgtrans_proj.doc_path())
         msg.exec_()
@@ -2631,24 +2602,23 @@ class MainWindow(mainwindow_cls):
             blk.text = self.ocrSubWidget.sub_text(text)
 
         # 字体检测：在 OCR 完成后按配置执行（按需导入以减少启动开销）
-        try:
-            if pcfg.module.ocr_font_detect:
+        # All errors are non-fatal -- font detect is a post-process enrichment,
+        # so log + clear the per-block field rather than aborting OCR results.
+        if pcfg.module.ocr_font_detect:
+            try:
+                from utils import font_detect
+            except Exception:
+                LOGGER.exception('failed to import font_detect module')
+                return
+            for blk in textblocks:
                 try:
-                    from utils import font_detect
-                    for blk in textblocks:
-                        try:
-                            name, conf = font_detect.detect_font_from_block(img, blk)
-                            blk._detected_font_name = name
-                            blk._detected_font_confidence = float(conf)
-                        except Exception:
-                            # don't break the pipeline on detector errors
-                            blk._detected_font_name = ''
-                            blk._detected_font_confidence = 0.0
+                    name, conf = font_detect.detect_font_from_block(img, blk)
+                    blk._detected_font_name = name
+                    blk._detected_font_confidence = float(conf)
                 except Exception:
-                    # failed to import or run detector
-                    pass
-        except Exception:
-            pass
+                    LOGGER.exception('font_detect failed on a textblock')
+                    blk._detected_font_name = ''
+                    blk._detected_font_confidence = 0.0
 
         # NOTE: Do NOT reset angle here - angle will be reset after pipeline finished in on_imgtrans_pipeline_finished()
         # This prevents angle from being reset when creating new text blocks or during OCR
@@ -2712,8 +2682,10 @@ class MainWindow(mainwindow_cls):
 
     def run_next_dir(self):
         if len(self.exec_dirs) == 0:
-            while self.imsave_thread.isRunning():
-                time.sleep(0.1)
+            # Wait for queued saves before quitting (headless batch mode).
+            # QThread.wait yields on an OS primitive instead of a 100ms poll.
+            if self.imsave_thread.isRunning():
+                self.imsave_thread.wait(30000)
             LOGGER.info(f'finished translating all dirs, quit app...')
             self.app.quit()
             return
@@ -2744,7 +2716,7 @@ class MainWindow(mainwindow_cls):
             err.exec()
             if exception_type != '':
                 shared.showed_exception.remove(exception_type)
-        except:
+        except Exception:
             if exception_type in shared.showed_exception:
                 shared.showed_exception.remove(exception_type)
             LOGGER.error('Failed to create error dialog')

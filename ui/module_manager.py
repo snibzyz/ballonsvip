@@ -5,7 +5,6 @@ import os.path as osp
 import numpy as np
 from qtpy.QtCore import QThread, Signal, QObject, QLocale, QTimer
 from qtpy.QtWidgets import QFileDialog
-from sympy import true
 
 from .funcmaps import get_maskseg_method
 from utils.logger import logger as LOGGER
@@ -65,7 +64,7 @@ class ModuleThread(QThread):
                     if hasattr(old_module, 'unload_model'):
                         old_module.unload_model()
                 except Exception:
-                    pass
+                    LOGGER.exception('unload_model failed for previous module')
                 del old_module
                 # release VRAM held by previous module
                 soft_empty_cache()
@@ -203,7 +202,7 @@ class TranslateThread(ModuleThread):
                     if hasattr(old_translator, 'unload_model'):
                         old_translator.unload_model()
                 except Exception:
-                    pass
+                    LOGGER.exception('unload_model failed for previous translator')
                 del old_translator
                 soft_empty_cache()
         except Exception as e:
@@ -321,13 +320,23 @@ class ImgtransThread(QThread):
         self.pages_to_process = None  # 需要处理的页面列表（用于继续运行模式）
 
     def on_module_thread_stopped(self):
-        while True:
-            # might freeze UI
-            if self.translate_thread.isRunning() or self.inpaint_thread.isRunning() or self.ocr_thread.isRunning() or self.textdetect_thread.isRunning():
-                time.sleep(0.05)
-                continue
-            break
+        # Wait for every worker thread to finish before announcing the
+        # pipeline has stopped. This slot runs on the main thread (the
+        # signal's owner lives there), so the previous `while True +
+        # time.sleep(0.05)` froze the UI until the slowest worker exited.
+        # A non-blocking QTimer poll keeps the event loop alive instead.
+        self._wait_workers_then_emit_stopped()
 
+    def _wait_workers_then_emit_stopped(self):
+        any_running = (
+            self.translate_thread.isRunning()
+            or self.inpaint_thread.isRunning()
+            or self.ocr_thread.isRunning()
+            or self.textdetect_thread.isRunning()
+        )
+        if any_running:
+            QTimer.singleShot(50, self._wait_workers_then_emit_stopped)
+            return
         self.pipeline_stopped.emit()
 
     @property

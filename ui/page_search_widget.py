@@ -9,6 +9,7 @@ from utils.config import pcfg
 from .custom_widget import Widget, ClickableLabel
 from .textitem import TextBlkItem
 from .textedit_area import TransPairWidget, SourceTextEdit, TransTextEdit
+from .misc import match_mods
 
 SEARCHRST_HIGHLIGHT_COLOR = QColor(30, 147, 229, 60)
 CURRENT_TEXT_COLOR = QColor(244, 249, 28)
@@ -118,6 +119,7 @@ class SearchEditor(QPlainTextEdit):
         self.shift_enter_prev = shift_enter_prev
         if commit_latency > 0:
             self.commit_timer = QTimer(self)
+            self.commit_timer.setSingleShot(True)  # avoid repeating after first timeout
             self.commit_timer.timeout.connect(self.on_commit_timer_timeout)
         else:
             self.commit_timer = None
@@ -141,7 +143,9 @@ class SearchEditor(QPlainTextEdit):
         if e.key() == Qt.Key.Key_Return:
             if self.commit_timer is not None:
                 self.commit_timer.stop()
-            if e.modifiers() == Qt.KeyboardModifier.ShiftModifier:
+            # Mask spurious modifier bits so Shift+Enter still matches when
+            # the active IME/layout sets Keypad / GroupSwitch alongside Shift.
+            if match_mods(e, Qt.KeyboardModifier.ShiftModifier):
                 if self.shift_enter_prev:
                     e.setAccepted(True)
                     self.shift_enter_pressed.emit()

@@ -4,11 +4,12 @@ import copy
 from qtpy.QtGui import QFont
 try:
     from qtpy.QtWidgets import QUndoCommand
-except:
+except ImportError:
     from qtpy.QtGui import QUndoCommand
 
 from . import shared_widget as SW
 from utils.fontformat import FontFormat, px2pt
+from utils.logger import logger as LOGGER
 from .textitem import TextBlkItem
 
 global_default_set_kwargs = dict(set_selected=False, restore_cursor=False)
@@ -47,7 +48,7 @@ def font_formating(push_undostack: bool = False, is_property = True):
                 if hasattr(act_ffmt, param_name):
                     act_ffmt[param_name] = values
                 else:
-                    print(f'undefined param name: {param_name}')
+                    LOGGER.warning('undefined fontformat param name: %s', param_name)
 
             blkitems, values = wrap_fntformat_input(values, blkitems, is_global)
             if len(blkitems) > 0:

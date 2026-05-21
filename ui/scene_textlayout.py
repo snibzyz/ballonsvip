@@ -11,9 +11,7 @@ from functools import lru_cache, cached_property
 from .misc import pixmap2ndarray, LruIgnoreArg
 from utils import shared as C
 from utils.fontformat import pt2px, FontFormat, LineSpacingType
-
-def print_transform(tr: QTransform):
-    print(f'[[{tr.m11(), tr.m12(), tr.m13()}]\n [{tr.m21(), tr.m22(), tr.m23()}]\n [{tr.m31(), tr.m32(), tr.m33()}]]')
+from utils.logger import logger as LOGGER
 
 
 PUNSET_HALF = {chr(i) for i in range(0x21, 0x7F)}
@@ -71,7 +69,7 @@ def punc_actual_rect(line: QTextLine, family: str, size: float, weight: int, ita
     p.end()
     mask = pixmap2ndarray(pixmap, keep_alpha=True)
     if mask is None:
-        print(f'invalid text line!')
+        LOGGER.debug('invalid text line!')
         return [0, 0, 1, 1]
     mask = mask[..., -1]
     

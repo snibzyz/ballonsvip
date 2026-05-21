@@ -2,13 +2,31 @@ from typing import List
 
 from qtpy.QtWidgets import QMenu, QMessageBox, QStackedLayout, QGraphicsDropShadowEffect, QLineEdit, QSizePolicy, QHBoxLayout, QVBoxLayout, QPushButton, QLabel
 from qtpy.QtCore import Signal, Qt, QRectF
-from qtpy.QtGui import QMouseEvent, QFontMetrics, QColor, QPixmap, QPainter, QContextMenuEvent
+from qtpy.QtGui import QMouseEvent, QFontMetrics, QColor, QPixmap, QPainter, QContextMenuEvent, QIcon
 
 
 from utils.fontformat import FontFormat
 from utils.config import save_text_styles, text_styles
 from utils import config as C
 from .custom_widget import PanelArea, Widget, FlowLayout
+
+# Precomputed stylesheet strings -- setStyleSheet still re-runs the QSS
+# parser, but keeping these as constants makes the hot-path intent clear
+# and avoids per-call literal allocation.
+_STYLE_PRESET_ACTIVE = "border: 2px solid rgb(30, 147, 229)"
+_STYLE_PRESET_INACTIVE = ""
+_STYLE_DELETE_BTN_BORDER_NONE = "border: none"
+
+# Lazily built; first hover after process start pays the icon-load cost.
+_DELETE_ICON_VISIBLE: QIcon = None
+_DELETE_ICON_BLANK: QIcon = None
+
+def _get_delete_icons():
+    global _DELETE_ICON_VISIBLE, _DELETE_ICON_BLANK
+    if _DELETE_ICON_VISIBLE is None:
+        _DELETE_ICON_VISIBLE = QIcon("icons/titlebar_close.svg")
+        _DELETE_ICON_BLANK = QIcon()
+    return _DELETE_ICON_VISIBLE, _DELETE_ICON_BLANK
 
 
 class ArrowLeftButton(QPushButton):
@@ -119,7 +137,18 @@ class TextStyleLabel(Widget):
         self.delete_btn.setFixedSize(dsize, dsize)
         self.delete_btn.setToolTip(self.tr("Delete Style"))
         self.delete_btn.clicked.connect(self.on_delete_btn_clicked)
-        self.delete_btn.setStyleSheet("border: none")
+        # One-time stylesheet; hover toggles the icon (setIcon is cheap;
+        # setStyleSheet on every mouse-over rebuilds the QSS selector tree
+        # and was a noticeable jank source in the style gallery).
+        self.delete_btn.setStyleSheet(_STYLE_DELETE_BTN_BORDER_NONE)
+        self.delete_btn.setIcon(_get_delete_icons()[1])
+        # Cached drop-shadow effect; previously a new QGraphicsDropShadowEffect
+        # was allocated on every enterEvent. Reuse means hovering the gallery
+        # no longer churns the GC for short-lived QObjects.
+        self._hover_shadow = QGraphicsDropShadowEffect()
+        self._hover_shadow.setBlurRadius(6)
+        self._hover_shadow.setOffset(0, 0)
+        self._hover_shadow.setColor(QColor(30, 147, 229))
         
         hlayout = QHBoxLayout(self)
         hlayout.setContentsMargins(0, 0, 3, 0)
@@ -156,10 +185,7 @@ class TextStyleLabel(Widget):
             
     def setActive(self, active: bool):
         self.active = active
-        if active:
-            self.setStyleSheet("border: 2px solid rgb(30, 147, 229)")
-        else:
-            self.setStyleSheet("")
+        self.setStyleSheet(_STYLE_PRESET_ACTIVE if active else _STYLE_PRESET_INACTIVE)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -217,28 +243,25 @@ class TextStyleLabel(Widget):
             self.stylelabel.selectAll()
 
     def setHoverEffect(self, hover: bool):
+        # Toggle the pre-allocated shadow on/off rather than building a new
+        # QGraphicsDropShadowEffect every hover. RuntimeError ("wrapped C/C++
+        # object has been deleted") can fire if Qt has already destroyed the
+        # widget mid-shutdown, so the try/except stays.
         try:
-            if hover:
-                se = QGraphicsDropShadowEffect()
-                se.setBlurRadius(6)
-                se.setOffset(0, 0)
-                se.setColor(QColor(30, 147, 229))
-                self.setGraphicsEffect(se)
-            else:
-                self.setGraphicsEffect(None)
+            self.setGraphicsEffect(self._hover_shadow if hover else None)
         except RuntimeError:
             pass
 
     def enterEvent(self, event) -> None:
         self.setHoverEffect(True)
         self.leftstack.setCurrentIndex(1)
-        self.delete_btn.setStyleSheet("image: url(icons/titlebar_close.svg); border: none")
+        self.delete_btn.setIcon(_get_delete_icons()[0])
         return super().enterEvent(event)
-    
+
     def leaveEvent(self, event) -> None:
         self.setHoverEffect(False)
         self.leftstack.setCurrentIndex(0)
-        self.delete_btn.setStyleSheet("image: \"none\"; border: none")
+        self.delete_btn.setIcon(_get_delete_icons()[1])
         return super().leaveEvent(event)
     
     def on_style_name_edited(self):

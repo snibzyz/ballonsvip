@@ -4,7 +4,7 @@ from qtpy.QtGui import QTextCursor
 from qtpy.QtCore import QPointF
 try:
     from qtpy.QtWidgets import QUndoCommand
-except:
+except ImportError:
     from qtpy.QtGui import QUndoCommand
 
 from .textitem import TextBlkItem, TextBlock

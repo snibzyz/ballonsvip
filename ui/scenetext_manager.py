@@ -9,7 +9,7 @@ from qtpy.QtCore import QObject, QRectF, Qt, Signal, QPointF, QPoint
 from qtpy.QtGui import QKeyEvent, QTextCursor, QFontMetricsF, QFont, QTextCharFormat, QClipboard
 try:
     from qtpy.QtWidgets import QUndoCommand
-except:
+except ImportError:
     from qtpy.QtGui import QUndoCommand
 
 from .textitem import TextBlkItem, TextBlock
@@ -147,7 +147,7 @@ class DeleteBlkItemsCommand(QUndoCommand):
             img_array = self.canvas.imgtrans_proj.inpainted_array
             mask_array = self.canvas.imgtrans_proj.mask_array
             for mskpnt, inpaint_rect, redo_img in zip(self.mask_pnts, self.inpaint_rect_lst, self.redo_img_list):
-                if mskpnt == None:
+                if mskpnt is None:
                     continue
                 x1, y1, x2, y2 = inpaint_rect
                 img_array[y1: y2, x1: x2][mskpnt] = redo_img[mskpnt]
@@ -183,7 +183,7 @@ class DeleteBlkItemsCommand(QUndoCommand):
             img_array = self.canvas.imgtrans_proj.inpainted_array
             mask_array = self.canvas.imgtrans_proj.mask_array
             for mskpnt, inpaint_rect, undo_img in zip(self.mask_pnts, self.inpaint_rect_lst, self.undo_img_list):
-                if mskpnt == None:
+                if mskpnt is None:
                     continue
                 x1, y1, x2, y2 = inpaint_rect
                 img_array[y1: y2, x1: x2][mskpnt] = undo_img[mskpnt]

@@ -72,19 +72,24 @@ class ImgSaveThread(ThreadBase):
                 self.autosave_item_done.emit()
 
     def on_exec_failed(self):
-        if len(self.im_save_list) > 0:
+        # Drain the queue iteratively. The previous implementation recursed
+        # via self.job() -> on_exec_failed() -> self.job() ..., which on a
+        # series of bad items would blow the Python stack. Iterating also
+        # keeps the error dialog ordering sane (one popup per failure).
+        while len(self.im_save_list) > 0:
             failed_item = self.im_save_list.pop(0)
             # Always notify autosave tracking on failure so the in-flight counter cannot leak.
             if len(failed_item) >= 6 and failed_item[5]:
                 self.autosave_item_done.emit()
             if len(self.im_save_list) == 0:
                 self.job = None
-            else:
-                try:
-                    self.job()
-                except Exception as e:
-                    self.on_exec_failed()
-                    create_error_dialog(e, self._thread_error_msg, self._thread_exception_type)
+                return
+            try:
+                self.job()
+                return  # job() drained the rest of the queue successfully
+            except Exception as e:
+                create_error_dialog(e, self._thread_error_msg, self._thread_exception_type)
+                # loop continues; next iteration pops the offender and retries
 
 
 
@@ -304,14 +309,14 @@ class MergeThread(ThreadBase):
             
             self.progress_changed.emit(i + 1, total)
         
-        # 打印失败的图片列表
+        # Print failed image list (via LOGGER so log level / sinks apply).
         if failed_images:
-            print(f"\n{'='*60}")
-            print(f"区域合并失败列表 (共 {len(failed_images)} 个):")
-            print(f"{'='*60}")
+            LOGGER.info('=' * 60)
+            LOGGER.info('Region-merge failure list (total %d):', len(failed_images))
+            LOGGER.info('=' * 60)
             for img_name, reason in failed_images:
-                print(f"  {img_name}: {reason}")
-            print(f"{'='*60}\n")
+                LOGGER.info('  %s: %s', img_name, reason)
+            LOGGER.info('=' * 60)
         
         # 一次性写入JSON文件
         if modified and not self.stop_requested:

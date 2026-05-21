@@ -19,6 +19,76 @@ ARROWKEY2DIRECTION = {
     QKEY.Key_Down: QPointF(0., 1.),
 }
 
+# Layout-independent shortcut helpers.
+#
+# Qt's `event.key()` returns a Qt.Key value that reflects the produced
+# character, and `event.modifiers() == ...` is brittle when a driver/IME
+# sets spurious bits (Keypad, GroupSwitch, ...). Both bite hard on Thai
+# (Kedmanee) and other non-Latin layouts: physical D emits Qt.Key_thai_*
+# instead of Qt.Key_D, so any shortcut keyed on `Key_D` silently dies.
+#
+# Use `match_shortcut(event, mods, vk)` for letter/symbol shortcuts and
+# `match_mods(event, mods)` for modifier-only checks (Ctrl+wheel etc.).
+# vk values are Windows VK_* codes (event.nativeVirtualKey()), which are
+# position-based and identical across every layout on Windows.
+def _modint(m) -> int:
+    # PyQt6 6.x: int(Qt.KeyboardModifier.X) raises TypeError even for a
+    # single enum value -- the enum class is not directly castable.
+    # `.value` always returns the underlying int and works on enum values,
+    # bitwise-OR results, and integer literals (after isinstance check).
+    # We keep the function tolerant so callers can pass any of: a raw int,
+    # an enum value, a bitwise-OR of enums, or a QFlags object.
+    if isinstance(m, int):
+        return m
+    if hasattr(m, 'value'):
+        return int(m.value)
+    return int(m)
+
+# Pre-computed integer modifier constants. Use these at call sites instead
+# of `int(Qt.KeyboardModifier.X)` (which raises on PyQt6 6.x).
+MOD_NONE = 0
+MOD_CTRL = _modint(Qt.KeyboardModifier.ControlModifier)
+MOD_SHIFT = _modint(Qt.KeyboardModifier.ShiftModifier)
+MOD_ALT = _modint(Qt.KeyboardModifier.AltModifier)
+MOD_META = _modint(Qt.KeyboardModifier.MetaModifier)
+MOD_CTRL_SHIFT = MOD_CTRL | MOD_SHIFT
+MOD_CTRL_ALT = MOD_CTRL | MOD_ALT
+MOD_SHIFT_ALT = MOD_SHIFT | MOD_ALT
+
+SHORTCUT_MOD_MASK = MOD_CTRL | MOD_SHIFT | MOD_ALT | MOD_META
+
+def match_mods(event, mods) -> bool:
+    """True iff event's relevant modifier bits exactly equal `mods`."""
+    return (_modint(event.modifiers()) & SHORTCUT_MOD_MASK) == _modint(mods)
+
+def match_shortcut(event, mods, vk) -> bool:
+    """Layout-independent shortcut match by Windows VK + masked modifiers.
+
+    `mods` is an int (e.g. `int(Qt.ControlModifier)`) or 0 for no modifier.
+    `vk` is a Windows VK_* code (0x41 = A, 0x44 = D, ...). On non-Windows
+    platforms nativeVirtualKey returns a different code system, so callers
+    that need cross-platform coverage must fall back to event.key().
+    """
+    if not match_mods(event, mods):
+        return False
+    return event.nativeVirtualKey() == vk
+
+# Windows VK_* codes for the letter/symbol keys we care about. Kept here
+# so call sites don't sprinkle raw 0x?? constants.
+class VK:
+    A = 0x41; B = 0x42; C = 0x43; D = 0x44; E = 0x45; F = 0x46; G = 0x47
+    H = 0x48; I = 0x49; J = 0x4A; K = 0x4B; L = 0x4C; M = 0x4D; N = 0x4E
+    O = 0x4F; P = 0x50; Q = 0x51; R = 0x52; S = 0x53; T = 0x54; U = 0x55
+    V = 0x56; W = 0x57; X = 0x58; Y = 0x59; Z = 0x5A
+    LBRACKET = 0xDB; RBRACKET = 0xDD
+    PLUS = 0xBB; MINUS = 0xBD
+    SPACE = 0x20; ESC = 0x1B; DEL = 0x2E
+    UP = 0x26; DOWN = 0x28; LEFT = 0x25; RIGHT = 0x27
+    HOME = 0x24; END = 0x23
+    PAGEUP = 0x21; PAGEDOWN = 0x22
+    RETURN = 0x0D
+    F1 = 0x70  # ... add more as needed
+
 # return bgr tuple
 def qrgb2bgr(color: Union[QColor, Tuple, List] = None) -> Tuple[int, int, int]:
     if color is not None:

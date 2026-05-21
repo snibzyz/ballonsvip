@@ -9,10 +9,10 @@ from qtpy.QtGui import QKeySequence, QPixmap, QImage, QHideEvent, QKeyEvent, QWh
 
 try:
     from qtpy.QtWidgets import QUndoStack, QUndoCommand
-except:
+except ImportError:
     from qtpy.QtGui import QUndoStack, QUndoCommand
 
-from .misc import ndarray2pixmap, QKEY, QNUMERIC_KEYS, ARROWKEY2DIRECTION
+from .misc import ndarray2pixmap, QKEY, QNUMERIC_KEYS, ARROWKEY2DIRECTION, match_mods, match_shortcut, SHORTCUT_MOD_MASK, VK, MOD_CTRL, MOD_ALT, MOD_CTRL_SHIFT
 from .textitem import TextBlkItem, TextBlock
 from .texteditshapecontrol import TextBlkShapeControl
 from .custom_widget import ScrollBar, FadeLabel
@@ -80,8 +80,10 @@ class CustomGV(QGraphicsView):
 
     def wheelEvent(self, event : QWheelEvent) -> None:
         # qgraphicsview always scroll content according to wheelevent
-        # which is not desired when scaling img
-        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+        # which is not desired when scaling img.
+        # Mask spurious modifier bits (Keypad / GroupSwitch / ...) so the
+        # Ctrl+wheel match still fires under non-Latin keyboard layouts.
+        if match_mods(event, Qt.KeyboardModifier.ControlModifier):
             if event.angleDelta().y() > 0:
                 self.scale_up_signal.emit()
             else:
@@ -100,31 +102,29 @@ class CustomGV(QGraphicsView):
         if key == QKEY.Key_Control:
             self.ctrl_pressed = True
 
-        modifiers = e.modifiers()
-        if modifiers == Qt.KeyboardModifier.ControlModifier:
-            if key == QKEY.Key_V:
-                # self.ctrlv_pressed.emit(e)
-                if self.canvas.handle_ctrlv():
-                    e.accept()
-                    return
-            if key == QKEY.Key_C:
-                if self.canvas.handle_ctrlc():
-                    e.accept()
-                    return
-                
-        elif modifiers & Qt.KeyboardModifier.ControlModifier and modifiers & Qt.KeyboardModifier.ShiftModifier:
-            if key == QKEY.Key_C:
-                self.canvas.copy_src_signal.emit()
+        # Layout-independent dispatch by Windows VK + masked modifiers.
+        # Matching on Qt.Key_V here would silently fail on Thai/Russian/etc.
+        # because the physical V key emits a different Qt.Key value.
+        if match_shortcut(e, MOD_CTRL, VK.V):
+            if self.canvas.handle_ctrlv():
                 e.accept()
                 return
-            elif key == QKEY.Key_V:
-                self.canvas.paste_src_signal.emit()
+        elif match_shortcut(e, MOD_CTRL, VK.C):
+            if self.canvas.handle_ctrlc():
                 e.accept()
                 return
-            elif key == QKEY.Key_D:
-                self.canvas.delete_textblks.emit(1)
-                e.accept()
-                return
+        elif match_shortcut(e, MOD_CTRL_SHIFT, VK.C):
+            self.canvas.copy_src_signal.emit()
+            e.accept()
+            return
+        elif match_shortcut(e, MOD_CTRL_SHIFT, VK.V):
+            self.canvas.paste_src_signal.emit()
+            e.accept()
+            return
+        elif match_shortcut(e, MOD_CTRL_SHIFT, VK.D):
+            self.canvas.delete_textblks.emit(1)
+            e.accept()
+            return
 
         return super().keyPressEvent(e)
     
@@ -547,18 +547,21 @@ class Canvas(QGraphicsScene):
         painter = QPainter(pixmap)
         origin = QPoint(0, 0)
 
-        if need_original_overlay:
-            painter.setOpacity(pcfg.original_transparency)
-            if inpainted_as_base:
-                painter.drawPixmap(origin, ndarray2pixmap(self.imgtrans_proj.img_array))
-            else:
-                painter.drawPixmap(origin, pixmap)
+        try:
+            if need_original_overlay:
+                painter.setOpacity(pcfg.original_transparency)
+                if inpainted_as_base:
+                    painter.drawPixmap(origin, ndarray2pixmap(self.imgtrans_proj.img_array))
+                else:
+                    painter.drawPixmap(origin, pixmap)
 
-        if need_mask_overlay:
-            painter.setOpacity(pcfg.mask_transparency)
-            painter.drawPixmap(origin, ndarray2pixmap(self.imgtrans_proj.mask_array))
-
-        painter.end()
+            if need_mask_overlay:
+                painter.setOpacity(pcfg.mask_transparency)
+                painter.drawPixmap(origin, ndarray2pixmap(self.imgtrans_proj.mask_array))
+        finally:
+            # Guarantee painter is released; otherwise the QPixmap stays
+            # locked and the next setPixmap silently fails on some Qt builds.
+            painter.end()
         self.inpaintLayer.setPixmap(pixmap)
 
     def setMaskTransparency(self, transparency: float):
@@ -628,14 +631,17 @@ class Canvas(QGraphicsScene):
     def keyPressEvent(self, event: QKeyEvent) -> None:
         key = event.key()
 
-        modifiers = event.modifiers()
-        if (modifiers == Qt.KeyboardModifier.AltModifier) and \
-            not key == QKEY.Key_Alt and \
-                self.editing_textblkitem is None:
-            if key in {QKEY.Key_W, QKEY.Key_A, QKEY.Key_Left, QKEY.Key_Up}:
+        # Alt + W/A/S/D + arrows switches the active text item. Arrow keys
+        # have layout-independent Qt.Key values so the original `key in {...}`
+        # check still works for them; W/A/S/D do not (Thai produces different
+        # Qt.Key values), so test those by Windows VK against the masked
+        # AltModifier instead.
+        if match_mods(event, MOD_ALT) and key != QKEY.Key_Alt and self.editing_textblkitem is None:
+            vk = event.nativeVirtualKey()
+            if vk in (VK.W, VK.A) or key in {QKEY.Key_Left, QKEY.Key_Up}:
                 self.on_switch_item(-1, event)
                 return
-            elif key in {QKEY.Key_S, QKEY.Key_D, QKEY.Key_Right, QKEY.Key_Down}:
+            if vk in (VK.S, VK.D) or key in {QKEY.Key_Right, QKEY.Key_Down}:
                 self.on_switch_item(1, event)
                 return
 

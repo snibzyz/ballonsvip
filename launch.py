@@ -45,8 +45,11 @@ GPU_CACHE_TTL = 604800  # 7 days
 def _ensure_tmp_dir():
     try:
         os.makedirs(PATH_TMP, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        # Swallow but log -- if the tmp dir can't be created, cache writes
+        # later will fail with confusing IOErrors, and "why did my cache
+        # break" needs a breadcrumb to start from.
+        sys.stderr.write(f'[launch] could not create tmp dir {PATH_TMP}: {e}\n')
 
 IS_WIN7 = "Windows-7" in platform()
 

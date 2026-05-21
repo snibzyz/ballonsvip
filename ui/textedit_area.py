@@ -9,6 +9,7 @@ import numpy as np
 
 from .custom_widget import ScrollBar, Widget, SeparatorWidget, ClickableLabel
 from .textitem import TextBlock
+from .misc import match_shortcut, VK, match_mods, MOD_CTRL, MOD_CTRL_SHIFT
 from utils.config import pcfg
 from utils.logger import logger as LOGGER
 
@@ -16,6 +17,12 @@ from utils.logger import logger as LOGGER
 STYLE_TRANSPAIR_CHECKED = "background-color: rgba(30, 147, 229, 20%);"
 STYLE_TRANSPAIR_BOTTOM = "border-width: 5px; border-bottom-style: solid; border-color: rgb(30, 147, 229);"
 STYLE_TRANSPAIR_TOP = "border-width: 5px; border-top-style: solid; border-color: rgb(30, 147, 229);"
+
+# Precomputed stylesheets for the check-state toggle. Hot path: multi-
+# selecting 30+ pairs would otherwise allocate + parse a fresh QSS string
+# per pair per click.
+_STYLE_TRANSPAIR_CHECKED_QSS = 'TransPairWidget{' + STYLE_TRANSPAIR_CHECKED + '}'
+_STYLE_TRANSPAIR_UNCHECKED_QSS = ''
 
 
 class SelectTextMiniMenu(Widget):
@@ -240,7 +247,7 @@ class SourceTextEdit(QTextEdit):
         return super().focusOutEvent(event)
 
     def inputMethodEvent(self, e: QInputMethodEvent) -> None:
-        if self.pre_editing is False:
+        if not self.pre_editing:
             cursor = self.textCursor()
             self.input_method_from = cursor.selectionStart()
         if e.preeditString() == '':
@@ -255,23 +262,24 @@ class SourceTextEdit(QTextEdit):
             e.setAccepted(True)
             return
 
-        if e.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            if e.key() == Qt.Key.Key_Z:
-                e.accept()
-                self.undo_signal.emit()
-                return
-            elif e.key() == Qt.Key.Key_Y:
-                e.accept()
-                self.redo_signal.emit()
-                return
-            elif e.key() == Qt.Key.Key_V:
-                self.paste_flag = True
-                return super().keyPressEvent(e)
-        elif e.modifiers() == Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier:
-            if e.key() == Qt.Key.Key_Z:
-                e.accept()
-                self.redo_signal.emit()
-                return
+        # Layout-independent: Qt.Key_Z/Y/V are character-based and don't
+        # match under Thai/Russian/... layouts. Route via Windows VK so
+        # Ctrl+Z/Y/V (+ Ctrl+Shift+Z redo) work irrespective of layout.
+        if match_shortcut(e, MOD_CTRL, VK.Z):
+            e.accept()
+            self.undo_signal.emit()
+            return
+        elif match_shortcut(e, MOD_CTRL, VK.Y):
+            e.accept()
+            self.redo_signal.emit()
+            return
+        elif match_shortcut(e, MOD_CTRL, VK.V):
+            self.paste_flag = True
+            return super().keyPressEvent(e)
+        elif match_shortcut(e, MOD_CTRL_SHIFT, VK.Z):
+            e.accept()
+            self.redo_signal.emit()
+            return
         elif e.key() == Qt.Key.Key_Return:
             e.accept()
             self.textCursor().insertText('\n')
@@ -461,19 +469,20 @@ class TransPairWidget(Widget):
         """
         if self.checked != checked:
             self.checked = checked
-            if checked:
-                self.setStyleSheet('TransPairWidget{' + f'{STYLE_TRANSPAIR_CHECKED}' + '}')
-            else:
-                self.setStyleSheet("")
+            self.setStyleSheet(_STYLE_TRANSPAIR_CHECKED_QSS if checked else _STYLE_TRANSPAIR_UNCHECKED_QSS)
 
     def update_checkstate_by_mousevent(self, e: QMouseEvent):
         if e.button() == Qt.MouseButton.LeftButton:
-            modifiers = e.modifiers()
-            if modifiers & Qt.KeyboardModifier.ShiftModifier and modifiers & Qt.KeyboardModifier.ControlModifier:
+            # Use masked comparison so spurious Keypad/GroupSwitch bits
+            # don't break shift/ctrl-click multi-select on non-Latin layouts.
+            shift = match_mods(e, Qt.KeyboardModifier.ShiftModifier)
+            ctrl = match_mods(e, Qt.KeyboardModifier.ControlModifier)
+            both = match_mods(e, Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier)
+            if both:
                 shift_pressed = ctrl_pressed = True
             else:
-                shift_pressed = modifiers == Qt.KeyboardModifier.ShiftModifier
-                ctrl_pressed = modifiers == Qt.KeyboardModifier.ControlModifier
+                shift_pressed = shift
+                ctrl_pressed = ctrl
             self.check_state_changed.emit(self, shift_pressed, ctrl_pressed)
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
