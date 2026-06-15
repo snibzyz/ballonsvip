@@ -86,20 +86,21 @@ class LeftBar(Widget):
         self.configChecker.checked.connect(self.stateCheckerChanged)
         self.configChecker.unchecked.connect(self.stateCheckerChanged)
 
-        actionOpenFolder = QAction(self.tr("Open Folder ..."), self)
+        # Menu items only show the shortcut as a hint (trailing-tab text).
+        # Actual key handling is the layout-independent VK table in MainWindow
+        # -- no QShortcut/QAction shortcut is registered here, because those
+        # match by produced character and break / go ambiguous on Thai layouts.
+        actionOpenFolder = QAction(self.tr("Open Folder ...") + "\tCtrl+O", self)
         actionOpenFolder.triggered.connect(self.onOpenFolder)
-        actionOpenFolder.setShortcut(QKeySequence.Open)
 
         actionOpenProj = QAction(self.tr("Open Project ... *.json"), self)
         actionOpenProj.triggered.connect(self.onOpenProj)
 
-        actionSaveProj = QAction(self.tr("Save Project"), self)
+        actionSaveProj = QAction(self.tr("Save Project") + "\tCtrl+S", self)
         self.save_proj = actionSaveProj.triggered
-        actionSaveProj.setShortcut(QKeySequence.StandardKey.Save)
 
-        actionReloadProj = QAction(self.tr("Reload Project"), self)
+        actionReloadProj = QAction(self.tr("Reload Project") + "\tF5", self)
         self.reload_proj = actionReloadProj.triggered
-        actionReloadProj.setShortcut(QKeySequence.Refresh)
 
         actionExportAsDoc = QAction(self.tr("Export as Doc"), self)
         self.export_doc = actionExportAsDoc.triggered
@@ -335,20 +336,16 @@ class TitleBar(Widget):
         self.editToolBtn = TitleBarToolBtn(self)
         self.editToolBtn.setText(self.tr('Edit'))
 
-        undoAction = QAction(self.tr('Undo'), self)
+        # Shortcut text is a display-only hint (trailing tab); real dispatch
+        # is MainWindow's layout-independent VK table.
+        undoAction = QAction(self.tr('Undo') + '\tCtrl+Z', self)
         self.undo_trigger = undoAction.triggered
-        undoAction.setShortcut(QKeySequence.StandardKey.Undo)
-        redoAction = QAction(self.tr('Redo'), self)
+        redoAction = QAction(self.tr('Redo') + '\tCtrl+Y', self)
         self.redo_trigger = redoAction.triggered
-        redoAction.setShortcut(QKeySequence.StandardKey.Redo)
-        pageSearchAction = QAction(self.tr('Search'), self)
+        pageSearchAction = QAction(self.tr('Search') + '\tCtrl+F', self)
         self.page_search_trigger = pageSearchAction.triggered
-        # Thai (Kedmanee) layout: Ctrl+ด is the same physical Ctrl+F.
-        pageSearchAction.setShortcuts([QKeySequence('Ctrl+F'), QKeySequence('Ctrl+ด')])
-        globalSearchAction = QAction(self.tr('Global Search'), self)
+        globalSearchAction = QAction(self.tr('Global Search') + '\tCtrl+G', self)
         self.global_search_trigger = globalSearchAction.triggered
-        # Thai (Kedmanee) layout: Ctrl+เ is the same physical Ctrl+G.
-        globalSearchAction.setShortcuts([QKeySequence('Ctrl+G'), QKeySequence('Ctrl+เ')])
 
         replacePreMTkeyword = QAction(self.tr("Keyword substitution for machine translation source text"), self)
         self.replacePreMTkeyword_trigger = replacePreMTkeyword.triggered
@@ -381,12 +378,8 @@ class TitleBar(Widget):
             lang_actions.append(la)
         self.displayLanguageMenu.addActions(lang_actions)
 
-        drawBoardAction = QAction(self.tr('Drawing Board'), self)
-        # Thai (Kedmanee): physical P key produces 'ฯ'.
-        drawBoardAction.setShortcuts([QKeySequence('P'), QKeySequence('ฯ')])
-        texteditAction = QAction(self.tr('Text Editor'), self)
-        # Thai (Kedmanee): physical T key produces 'ะ'.
-        texteditAction.setShortcuts([QKeySequence('T'), QKeySequence('ะ')])
+        drawBoardAction = QAction(self.tr('Drawing Board') + '\tP', self)
+        texteditAction = QAction(self.tr('Text Editor') + '\tT', self)
         importTextStyles = QAction(self.tr('Import Text Styles'), self)
         exportTextStyles = QAction(self.tr('Export Text Styles'), self)
         self.darkModeAction = darkModeAction = QAction(self.tr('Dark Mode'), self)
@@ -426,9 +419,7 @@ class TitleBar(Widget):
         self.toolsToolBtn.setText(self.tr('Tools'))
         
         # 区域合并工具
-        mergeToolAction = QAction('区域合并工具', self)
-        # Thai (Kedmanee): physical M key produces 'ท'.
-        mergeToolAction.setShortcuts([QKeySequence('Ctrl+Shift+M'), QKeySequence('Ctrl+Shift+ท')])
+        mergeToolAction = QAction('区域合并工具' + '\tCtrl+Shift+M', self)
         self.merge_tool_trigger = mergeToolAction.triggered
         
         toolsMenu = QMenu(self.toolsToolBtn)

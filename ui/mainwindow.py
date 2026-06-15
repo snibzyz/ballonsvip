@@ -783,6 +783,16 @@ class MainWindow(mainwindow_cls):
             focus_widget = QApplication.focusWidget()
             if self._focus_widget_is_text_input(focus_widget):
                 return
+            # Don't pull focus into the canvas while another window of ours
+            # (a dialog / message box) is active -- doing so steals keyboard
+            # focus from that dialog's buttons, so Spacebar stops activating
+            # its OK button. A deferred timer scheduled right after a non-modal
+            # popup .show() would otherwise fire while the popup is still open.
+            # Focus settles back on the canvas via changeEvent(ActivationChange)
+            # once the dialog closes.
+            active_window = QApplication.activeWindow()
+            if active_window is not None and active_window is not self:
+                return
             if gv.hasFocus():
                 return
             gv.setFocus()
@@ -866,6 +876,9 @@ class MainWindow(mainwindow_cls):
             (NONE, 0x20): self.shortcutSpace,                               # Space
             (NONE, 0x1B): self.shortcutEscape,                              # Esc
             (NONE, 0x2E): self.shortcutDelete,                              # Delete
+            (NONE, 0x21): self.shortcutBefore,                              # PageUp  -> prev page
+            (NONE, 0x22): self.shortcutNext,                                # PageDown -> next page
+            (NONE, 0x74): self.reloadCurrentProject,                        # F5 -> reload project
 
             # Ctrl chords
             (CTRL, 0x41): self.shortcutSelectAll,                           # Ctrl+A
@@ -889,6 +902,7 @@ class MainWindow(mainwindow_cls):
             (CTRL_SHIFT, 0xBB): scale_up,                                   # Ctrl++
             (CTRL_SHIFT, 0x4D): self.on_open_merge_tool,                    # Ctrl+Shift+M
             (CTRL_SHIFT, 0x52): self.shortcutAutoSortReadingOrder,          # Ctrl+Shift+R
+            (CTRL_SHIFT, 0x5A): self.on_redo,                               # Ctrl+Shift+Z -> redo
 
             # Alt chords (navigation keys are layout-independent anyway,
             # but routing through the same table keeps behaviour uniform).
@@ -906,6 +920,15 @@ class MainWindow(mainwindow_cls):
         # Returns True when the event has been consumed.
         fw = QApplication.focusWidget()
         if self._focus_widget_is_text_input(fw):
+            return False
+
+        # Bail out while a dialog / message box of ours is the active window.
+        # This filter is installed on the QApplication, so it also sees the
+        # dialog's key events -- dispatching a canvas shortcut here would
+        # consume Space/Esc/etc. before the dialog's OK button receives them,
+        # which is exactly why Spacebar could not confirm export popups.
+        active_window = QApplication.activeWindow()
+        if active_window is not None and active_window is not self:
             return False
 
         table = getattr(self, '_vk_shortcut_table', None)
@@ -1011,153 +1034,16 @@ class MainWindow(mainwindow_cls):
         self.titleBar.darkmode_trigger.connect(self.on_darkmode_triggered)
         self.titleBar.merge_tool_trigger.connect(self.on_open_merge_tool)
 
-        # Thai-keyboard fallback table. Qt's QShortcut("A") matches by produced
-        # character, not the physical key; on a Thai (Kedmanee) layout the same
-        # physical keys produce different characters and the English bindings
-        # never fire while Thai input is active. Registering parallel shortcuts
-        # for the Thai equivalents lets users operate the app without flipping
-        # IME state.
-        #
-        # Each physical English key gets BOTH the unshifted and the shifted
-        # Kedmanee variant where they differ -- some users hold shift purely
-        # to access symbols (e.g. '[' shifted) without realising the layout
-        # remap also moves the underlying character. We register every variant
-        # because handler bodies are idempotent and Qt deduplicates by sequence.
-        self._thai_keymap = {
-            'A': ['ฟ'],
-            'D': ['ก'],
-            'W': ['ไ'],
-            'N': ['ื'],
-            'H': ['้'],
-            'R': ['พ'],
-            'B': ['ิ'],
-            'J': ['่'],
-            '[': ['บ', 'ฃ'],        # unshifted then shifted Kedmanee
-            ']': ['ล', 'ฯ'],
-            'T': ['ะ'],
-            'P': ['ย'],
-            'E': ['ำ'],
-            'F': ['ด'],
-            'G': ['เ'],
-            'M': ['ท'],
-        }
-
-        # Helper: register one or more shortcut sequences against a single
-        # handler. Works for plain keys (T) and for chord keys (Ctrl+J,
-        # Ctrl+Shift+R). Qt routes activated() back through self.sender() in
-        # downstream handlers, so we attach .key() metadata via the sequence
-        # string -- not via a partial -- to keep signal introspection working.
-        def _register_shortcuts(sequences, handler):
-            for seq in sequences:
-                sc = QShortcut(QKeySequence(seq), self)
-                sc.activated.connect(handler)
-            return None
-
-        # Build (eng_key, [eng+thai sequences]) pairs once so all the Ctrl/Alt
-        # combos that include a letter automatically gain Thai equivalents too.
-        def _seqs_for(*english_keys):
-            # english_keys: a list of plain keys (e.g. 'A', 'Ctrl+J', 'Ctrl+Shift+R').
-            # For each, also emit the Thai-equivalent variants if a single
-            # letter or symbol is present in the chord. Returns the original
-            # list plus the Thai duplicates -- the original always comes first
-            # so English-keyboard users hit the same QShortcut path.
-            out = []
-            for eng in english_keys:
-                out.append(eng)
-                # Operate on the trailing chord token so we only swap the
-                # final key, not modifier names. e.g. "Ctrl+Shift+R" -> "R".
-                parts = eng.split('+')
-                tail = parts[-1]
-                lookup_key = tail.upper() if (len(tail) == 1 and tail.isalpha()) else tail
-                thai_variants = self._thai_keymap.get(lookup_key)
-                if not thai_variants:
-                    continue
-                prefix = parts[:-1]
-                for thai in thai_variants:
-                    if prefix:
-                        out.append('+'.join(prefix + [thai]))
-                    else:
-                        out.append(thai)
-            return out
-
-        _register_shortcuts(_seqs_for('A'), self.shortcutBefore)
-        shortcutPageUp = QShortcut(QKeySequence(QKeySequence.StandardKey.MoveToPreviousPage), self)
-        shortcutPageUp.activated.connect(self.shortcutBefore)
-
-        _register_shortcuts(_seqs_for('D'), self.shortcutNext)
-        shortcutPageDown = QShortcut(QKeySequence(QKeySequence.StandardKey.MoveToNextPage), self)
-        shortcutPageDown.activated.connect(self.shortcutNext)
-
-        _register_shortcuts(_seqs_for('W'), self.shortcutTextblock)
-        shortcutZoomIn = QShortcut(QKeySequence.StandardKey.ZoomIn, self)
-        shortcutZoomIn.activated.connect(self.canvas.gv.scale_up_signal)
-        shortcutZoomOut = QShortcut(QKeySequence.StandardKey.ZoomOut, self)
-        shortcutZoomOut.activated.connect(self.canvas.gv.scale_down_signal)
-        # Ctrl+D needs Thai variant: Ctrl+ก produced by physical D on Kedmanee.
-        _register_shortcuts(_seqs_for('Ctrl+D'), self.shortcutCtrlD)
-        shortcutSpace = QShortcut(QKeySequence("Space"), self)
-        shortcutSpace.activated.connect(self.shortcutSpace)
-        shortcutSelectAll = QShortcut(QKeySequence.StandardKey.SelectAll, self)
-        shortcutSelectAll.activated.connect(self.shortcutSelectAll)
-
-        shortcutEscape = QShortcut(QKeySequence("Escape"), self)
-        shortcutEscape.activated.connect(self.shortcutEscape)
-
-        shortcutBold = QShortcut(QKeySequence.StandardKey.Bold, self)
-        shortcutBold.activated.connect(self.shortcutBold)
-        shortcutItalic = QShortcut(QKeySequence.StandardKey.Italic, self)
-        shortcutItalic.activated.connect(self.shortcutItalic)
-        shortcutUnderline = QShortcut(QKeySequence.StandardKey.Underline, self)
-        shortcutUnderline.activated.connect(self.shortcutUnderline)
-
-        shortcutDelete = QShortcut(QKeySequence.StandardKey.Delete, self)
-        shortcutDelete.activated.connect(self.shortcutDelete)
-
-        drawpanel_shortcuts = {'hand': 'H', 'rect': 'R', 'inpaint': 'J', 'pen': 'B'}
-        for tool_name, shortcut_key in drawpanel_shortcuts.items():
-            for seq in _seqs_for(shortcut_key):
-                shortcut = QShortcut(QKeySequence(seq), self)
-                shortcut.activated.connect(partial(self.drawingPanel.shortcutSetCurrentToolByName, tool_name))
-            # Tooltip still shows English key (the canonical hint to users).
+        # Keyboard shortcuts are dispatched layout-independently by the VK
+        # table (`_build_vk_shortcut_table`) through the application-level
+        # eventFilter. We deliberately register NO QShortcut/QKeySequence
+        # here: QShortcut matches by produced character, so it breaks on
+        # non-Latin layouts -- and registering explicit Thai variants next to
+        # Qt's own built-in Latin fallback produced *ambiguous* shortcuts that
+        # silently no-op (activatedAmbiguously). See _dispatch_shortcut_by_vk.
+        for tool_name, shortcut_key in {'hand': 'H', 'rect': 'R', 'inpaint': 'J', 'pen': 'B'}.items():
+            # Drawing-panel tool buttons still show the key hint as a tooltip.
             self.drawingPanel.setShortcutTip(tool_name, shortcut_key)
-
-        # Brush size: [ and ]. Thai equivalents from _thai_keymap.
-        _register_shortcuts(_seqs_for('['), self.drawingPanel.on_decre_pensize)
-        _register_shortcuts(_seqs_for(']'), self.drawingPanel.on_incre_pensize)
-
-        # Ctrl+E for OCR
-        _register_shortcuts(_seqs_for('Ctrl+E'), self.shortcutOCR)
-
-        # N: toggle the floating per-block number badges on the canvas.
-        # Persisted in pcfg so the choice survives restart.
-        _register_shortcuts(_seqs_for('N'), self.shortcutToggleNumberBadge)
-
-        # Ctrl+Shift+R: auto-sort blocks by manhwa reading order (top-to-bottom,
-        # left-to-right within rows). Pushes a single undoable RearrangeBlksCommand.
-        _register_shortcuts(_seqs_for('Ctrl+Shift+R'), self.shortcutAutoSortReadingOrder)
-
-        # Ctrl+J: jump-to-position quick reorder. Spawns a small numeric input
-        # popup over the selected block's badge so the user can type a 1-based
-        # target position and press Enter. Replaces drag-precision pain when
-        # there are 30+ badges packed together.
-        # NOTE on key choice: Ctrl+G is already bound to global search
-        # (mainwindowbars.py:349). Ctrl+J ("jump") is unused and keeps the
-        # mnemonic.
-        _register_shortcuts(_seqs_for('Ctrl+J'), self.shortcutQuickReorder)
-
-        # Block reorder shortcuts mirror the right-click context menu:
-        # Alt+Up/Down nudge by one slot; Alt+Home/End jump to top/bottom.
-        # All require a selected block in text edit mode.
-        # Arrow keys / Home / End are layout-independent (their character output
-        # does not change on Thai keyboards), so no Thai fallback is needed.
-        shortcutMoveBlockUp = QShortcut(QKeySequence("Alt+Up"), self)
-        shortcutMoveBlockUp.activated.connect(self.shortcutMoveBlockUp)
-        shortcutMoveBlockDown = QShortcut(QKeySequence("Alt+Down"), self)
-        shortcutMoveBlockDown.activated.connect(self.shortcutMoveBlockDown)
-        shortcutMoveBlockTop = QShortcut(QKeySequence("Alt+Home"), self)
-        shortcutMoveBlockTop.activated.connect(self.shortcutMoveBlockTop)
-        shortcutMoveBlockBottom = QShortcut(QKeySequence("Alt+End"), self)
-        shortcutMoveBlockBottom.activated.connect(self.shortcutMoveBlockBottom)
 
     def shortcutNext(self):
 
@@ -2723,9 +2609,16 @@ class MainWindow(mainwindow_cls):
             LOGGER.error(traceback.format_exc())
 
     def on_create_infodialog(self, info_dict: dict):
-        QMessageBox.StandardButton.NoButton
         dialog = MessageBox(**info_dict)
         dialog.show()   # exec_ will block main thread
+        # Give a button keyboard focus so Spacebar (which activates the
+        # *focused* widget) works, not just Enter (which activates the
+        # *default* button). The OK button is auto-added in showEvent, so
+        # it only exists after show().
+        buttons = dialog.buttons()
+        if buttons:
+            default_btn = dialog.defaultButton()
+            (default_btn or buttons[0]).setFocus()
 
     def setupRegisterWidget(self):
         self.titleBar.viewMenu.addSeparator()

@@ -354,12 +354,12 @@ class QuickReorderInputPopup(QLineEdit):
         self.submitted.emit(target_0based)
 
     def event(self, e):
-        # MainWindow registers single-key QShortcuts (A, D, W, N, Space, etc.)
-        # at WindowShortcut scope. Qt dispatches a ShortcutOverride event to the
-        # focused widget BEFORE activating the shortcut; if we accept it here,
-        # the shortcut never fires and the keystroke flows into our QLineEdit
-        # (where QIntValidator filters non-digits). Without this, typing "d" in
-        # the popup would trigger the next-page shortcut and dismiss the popup.
+        # MainWindow dispatches single-key shortcuts (A, D, W, N, Space, ...)
+        # from an application-level eventFilter keyed on Windows VK codes.
+        # The real guard against typing "d" here flipping the page is that
+        # this popup is whitelisted in MainWindow._focus_widget_is_text_input,
+        # so the VK dispatcher skips keystrokes while it holds focus. Accepting
+        # ShortcutOverride stays as harmless belt-and-braces.
         if e.type() == QEvent.Type.ShortcutOverride:
             e.accept()
             return True
